@@ -1,8 +1,8 @@
 # docs/testing/SUMMARY.md
 
-timestamp=2026-06-03T16:45:00+03:00
+timestamp=2026-06-03T17:12:00+03:00
 section=testing
-active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
+active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 ## Purpose
 
@@ -34,6 +34,7 @@ npm.cmd run build
 
 ## Latest Records
 
+- `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md`: dashboard production build passes after disabling public-dir copy; `dist/telemetry` is absent and `dist` payload is about 246 KB.
 - `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md`: no-code-change review; Docker Rust tests and Python syntax checks passed; dashboard build failed on telemetry copy `ENOSPC`.
 - `test_results/2026-06-03_simplify_agent_rules.md`: agent protocol simplification verification.
 - `test_results/2026-06-03_docs_cleanup.md`: documentation compaction verification.
@@ -45,5 +46,5 @@ npm.cmd run build
 
 - Broad official random-seed trace comparison is still not complete.
 - Current 64-model/20-participation full-generation timing is recorded but slow: generations 58-60 took about 1249-1398 seconds.
-- Dashboard production build is blocked while runtime telemetry remains under `dashboard/public/telemetry` and is copied into `dist`.
+- Dashboard production build no longer copies runtime telemetry after `dashboard/vite.config.ts` set `build.copyPublicDir=false`.
 - Browser screenshot capture has timed out before; DOM/interaction/canvas checks may be more reliable evidence.

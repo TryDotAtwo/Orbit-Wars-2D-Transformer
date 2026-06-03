@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T16:45:00+03:00
+timestamp=2026-06-03T17:12:00+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
+active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 ## How To Use This Index
 
@@ -125,6 +125,9 @@ active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
 | `test_results/2026-06-03_velocity_input_phase_aim_restart.md` | `64x7` input and phase-aware aiming verification. |
 | `prompt_history/20260603_163041_nvidia_perf_bug_review_no_code_changes.md` | Raw user prompt requesting no-code-change project/code/performance review with NVIDIA plugin use. |
 | `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md` | No-code-change code/performance review: Rust tests pass, dashboard build blocked by telemetry copy, current full_500 timing is slow. |
+| `prompt_history/20260603_170612_perf_memory_github_plugins_request.md` | Raw user prompt requesting plugin-assisted performance/memory work with incremental GitHub commits. |
+| `docs/superpowers/plans/2026-06-03-performance-memory-first-pass.md` | Superpowers implementation plan for the first performance/memory pass. |
+| `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md` | Dashboard production build verification after preventing runtime telemetry copy into `dist`. |
 
 ## Search Hints
 

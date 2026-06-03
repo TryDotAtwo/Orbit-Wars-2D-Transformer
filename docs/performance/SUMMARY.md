@@ -1,8 +1,8 @@
 # docs/performance/SUMMARY.md
 
-timestamp=2026-06-03T16:45:00+03:00
+timestamp=2026-06-03T17:12:00+03:00
 section=performance
-active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
+active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 ## Current Facts
 
@@ -13,7 +13,7 @@ active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
 - Live and completed replay storage were changed to avoid giant repeated JSON polling.
 - Dashboard replay chunks are loaded lazily; non-Replay tabs should fetch lightweight telemetry only.
 - Current 64-model/20-participation generations are measured but slow: generation 58 took about 1249 s, generation 59 about 1288 s, generation 60 about 1398 s.
-- Dashboard production build currently fails if runtime telemetry remains under `dashboard/public/telemetry`; the folder was about 10.85 GB during the 2026-06-03 review.
+- Dashboard production build no longer copies runtime telemetry into `dist`; `npm.cmd run build` produced a 245,917 byte payload after `build.copyPublicDir=false`.
 
 ## Active Bottlenecks
 
@@ -24,6 +24,7 @@ active_task_id=2026-06-03_nvidia_perf_bug_review_no_code_changes
 - GPU utilization telemetry is not a real measured occupancy metric unless separately collected.
 - Broad 65,536-game batch target is not proven.
 - Host-side request packing, decoding, per-turn worker spawning, and telemetry/replay file handling are likely material overheads around CUDA bursts.
+- Runtime telemetry still lives under `dashboard/public/telemetry` for dev serving; it remains about 10+ GB and should be managed separately from source/build outputs.
 
 ## Measurements To Run Next
 
