@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T17:43:00+03:00
+timestamp=2026-06-03T17:50:52+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_population_forward_scratch
+active_task_id=2026-06-03_live_completed_replay_storage_split
 
 ## How To Use This Index
 
@@ -73,7 +73,7 @@ active_task_id=2026-06-03_population_forward_scratch
 
 | path | purpose |
 |---|---|
-| `dashboard/src/App.tsx` | Dashboard views, telemetry loading, replay/chunk interaction. |
+| `dashboard/src/App.tsx` | Dashboard views, lightweight telemetry polling, replay/chunk interaction. |
 | `dashboard/src/Charts.tsx` | Metric chart rendering. |
 | `dashboard/src/ReplayCanvas.tsx` | Orbit Wars replay drawing. |
 | `dashboard/src/types.ts` | Dashboard telemetry and replay types. |
@@ -126,11 +126,14 @@ active_task_id=2026-06-03_population_forward_scratch
 | `prompt_history/20260603_163041_nvidia_perf_bug_review_no_code_changes.md` | Raw user prompt requesting no-code-change project/code/performance review with NVIDIA plugin use. |
 | `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md` | No-code-change code/performance review: Rust tests pass, dashboard build blocked by telemetry copy, current full_500 timing is slow. |
 | `prompt_history/20260603_170612_perf_memory_github_plugins_request.md` | Raw user prompt requesting plugin-assisted performance/memory work with incremental GitHub commits. |
+| `prompt_history/20260603_174000_create_private_github_repo.md` | Raw user prompt requesting a private GitHub repository for the project. |
+| `prompt_history/20260603_175000_keep_dashboard_running.md` | Raw user prompt requesting dashboard uptime for training observation while work continues. |
 | `docs/superpowers/plans/2026-06-03-performance-memory-first-pass.md` | Superpowers implementation plan for the first performance/memory pass. |
 | `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md` | Dashboard production build verification after preventing runtime telemetry copy into `dist`. |
 | `test_results/2026-06-03_checkpoint_path_config_fix.md` | Red/green verification for config/resume-aware trainer checkpoint save path. |
 | `test_results/2026-06-03_hot_loop_allocation_cleanup.md` | Red/green and full Rust verification for small trainer hot-loop allocation cleanup. |
 | `test_results/2026-06-03_population_forward_scratch.md` | Red/green and full Rust verification for reusable CUDA forward host packing scratch. |
+| `test_results/2026-06-03_live_completed_replay_storage_split.md` | Rust/dashboard/browser verification for append-only live replay storage and lazy completed replay loading. |
 
 ## Search Hints
 

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
 use std::thread;
@@ -61,7 +61,7 @@ const TRAINING_PROGRESS_PENDING_WARNING: &str = "training_generation_in_progress
 const TRAINING_LIVE_REPLAY_PROGRESS_WARNING: &str = "training_generation_live_replay_partial";
 const TELEMETRY_WRITE_ATTEMPTS: usize = 3;
 const TELEMETRY_WRITE_RETRY_DELAY_MS: u64 = 25;
-const LIVE_REPLAY_SLOT_FORMAT: &str = "orbit_live_replay_slots_v1";
+const LIVE_REPLAY_FORMAT: &str = "orbit_live_replay_v1";
 const LIVE_REPLAY_BINARY_MAGIC: &[u8] = b"OWLIVE1\n";
 const LIVE_REPLAY_RECORD_HEADER: u8 = 1;
 const LIVE_REPLAY_RECORD_FRAME: u8 = 2;
@@ -69,8 +69,6 @@ const LIVE_REPLAY_RECORD_RESULT: u8 = 3;
 const TRAINER_CHECKPOINT_MAGIC: &[u8] = b"OWTRAIN1";
 const TRAINER_CHECKPOINT_VERSION: u32 = 1;
 const GENERATION_TOP_MODELS_MAGIC: &[u8] = b"OWTOP4_1";
-const LIVE_REPLAY_SLOT_MAGIC: &[u8] = b"OWSLOT1\n";
-const LIVE_REPLAY_SLOT_LENGTH_BYTES: usize = 4;
 const KAGGLE_SUBMISSION_MAIN_FILE: &str = "main.py";
 const KAGGLE_SUBMISSION_LIBRARY_FILE: &str = "liborbit_wars_agent.so";
 const KAGGLE_SUBMISSION_MODEL_FILE: &str = "model.bin";
@@ -168,11 +166,7 @@ struct LiveReplayStorage {
     file_path: String,
     public_path: String,
     frame_count: usize,
-    frame_slots_per_game: usize,
-    frame_slot_bytes: usize,
-    frame_base_offset: u64,
-    result_base_offset: u64,
-    next_frame_slots: Vec<usize>,
+    game_count: usize,
     active_player_count: usize,
 }
 
@@ -394,6 +388,7 @@ struct ReplayGame {
 struct LiveReplayCompactionStats {
     game_count: usize,
     compact_bytes: u64,
+    source: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -755,8 +750,8 @@ fn main() -> Result<(), String> {
                 evolution_config.active_player_count,
             ) {
                 Ok(Some(stats)) => log_trainer_event(format!(
-                    "event=live_replay_compacted; run_id={run_id}; generation={generation}; source=owslot; target=owlive; games={}; bytes={}",
-                    stats.game_count, stats.compact_bytes
+                    "event=live_replay_compacted; run_id={run_id}; generation={generation}; source={}; target=owlive; games={}; bytes={}",
+                    stats.source, stats.game_count, stats.compact_bytes
                 ))?,
                 Ok(None) => {}
                 Err(error) => log_trainer_event(format!(
@@ -2703,7 +2698,7 @@ fn remove_replay_artifacts(run_id: &str, generation: usize) -> Result<(), String
     let paths = [
         replay_chunk_path(run_id, generation),
         live_replay_file_path(run_id, generation),
-        legacy_live_replay_file_path(run_id, generation),
+        legacy_live_replay_slot_file_path(run_id, generation),
         generation_top_models_path(run_id, generation),
     ];
     for path_string in paths {
@@ -4619,7 +4614,7 @@ fn write_live_replay_telemetry(
         turn_loop = OFFICIAL_TURN_LOOP_NAME,
         full_replay = json_bool(live_full_replay),
         replay_frame_stride = agent_config.dashboard_live_replay_frame_stride,
-        live_replay_format = LIVE_REPLAY_SLOT_FORMAT,
+        live_replay_format = LIVE_REPLAY_FORMAT,
         live_replay_path = live_replay_path,
         live_replay_frame_count = live_replay_frame_count,
         stored_replay_games = live_replay_game_count,
@@ -4993,7 +4988,7 @@ fn create_live_replay_storage(
     live_capture_count: usize,
     active_player_count: usize,
     run_id: &str,
-    agent_config: &AgentConfig,
+    _agent_config: &AgentConfig,
 ) -> Result<LiveReplayStorage, String> {
     let file_path = live_replay_file_path(run_id, generation);
     let public_path = live_replay_public_path(run_id, generation);
@@ -5003,7 +4998,8 @@ fn create_live_replay_storage(
     }
     let captured_game_count = live_capture_count.min(active_games.len());
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(LIVE_REPLAY_SLOT_MAGIC);
+    bytes.extend_from_slice(LIVE_REPLAY_BINARY_MAGIC);
+    bytes.push(LIVE_REPLAY_RECORD_HEADER);
     push_usize_as_u32(&mut bytes, generation, "live_replay_generation")?;
     push_usize_as_u32(
         &mut bytes,
@@ -5015,17 +5011,6 @@ fn create_live_replay_storage(
         captured_game_count,
         "live_replay_captured_game_count",
     )?;
-    let frame_slots_per_game =
-        live_replay_frame_slots_per_game(active_games, generation, agent_config)?;
-    let frame_slot_bytes = agent_config.dashboard_live_replay_slot_bytes;
-    push_usize_as_u32(
-        &mut bytes,
-        frame_slots_per_game,
-        "live_replay_frame_slots_per_game",
-    )?;
-    push_usize_as_u32(&mut bytes, frame_slot_bytes, "live_replay_frame_slot_bytes")?;
-    let frame_base_offset_placeholder = bytes.len();
-    push_u64(&mut bytes, 0);
     for (game_index, game) in active_games.iter().take(captured_game_count).enumerate() {
         push_usize_as_u32(&mut bytes, game_index, "live_replay_game_index")?;
         push_usize_as_u32(
@@ -5046,54 +5031,14 @@ fn create_live_replay_storage(
             )?;
         }
     }
-    let frame_base_offset =
-        u64::try_from(bytes.len()).map_err(|_| "live_replay_frame_base_overflow".to_string())?;
-    bytes[frame_base_offset_placeholder..frame_base_offset_placeholder + 8]
-        .copy_from_slice(&frame_base_offset.to_le_bytes());
-    let per_slot_bytes = LIVE_REPLAY_SLOT_LENGTH_BYTES + frame_slot_bytes;
-    let frame_area_bytes = captured_game_count
-        .checked_mul(frame_slots_per_game)
-        .and_then(|value| value.checked_mul(per_slot_bytes))
-        .ok_or_else(|| "live_replay_frame_area_overflow".to_string())?;
-    let result_base_offset = frame_base_offset
-        .checked_add(
-            u64::try_from(frame_area_bytes)
-                .map_err(|_| "live_replay_result_base_overflow".to_string())?,
-        )
-        .ok_or_else(|| "live_replay_result_base_overflow".to_string())?;
-    let result_area_bytes = captured_game_count
-        .checked_mul(LIVE_REPLAY_SLOT_LENGTH_BYTES + active_player_count * 4)
-        .ok_or_else(|| "live_replay_result_area_overflow".to_string())?;
     write_binary_with_retries(path, &bytes, "live_replay_write_failed")?;
-    let total_len = result_base_offset
-        .checked_add(
-            u64::try_from(result_area_bytes)
-                .map_err(|_| "live_replay_total_len_overflow".to_string())?,
-        )
-        .ok_or_else(|| "live_replay_total_len_overflow".to_string())?;
-    set_file_len_with_retries(path, total_len, "live_replay_preallocate_failed")?;
     Ok(LiveReplayStorage {
         file_path,
         public_path,
         frame_count: 0,
-        frame_slots_per_game,
-        frame_slot_bytes,
-        frame_base_offset,
-        result_base_offset,
-        next_frame_slots: vec![0; captured_game_count],
+        game_count: captured_game_count,
         active_player_count,
     })
-}
-
-fn live_replay_frame_slots_per_game(
-    active_games: &[ActiveGame],
-    generation: usize,
-    agent_config: &AgentConfig,
-) -> Result<usize, String> {
-    let first_game = active_games
-        .first()
-        .ok_or_else(|| format!("live_replay_no_games_for_generation={generation}"))?;
-    Ok(first_game.state.step + 1 + agent_config.episode_steps)
 }
 
 fn append_live_replay_frame(
@@ -5101,40 +5046,18 @@ fn append_live_replay_frame(
     game_index: usize,
     frame: &ReplayFrame,
 ) -> Result<(), String> {
-    let frame_slot = *storage
-        .next_frame_slots
-        .get(game_index)
-        .ok_or_else(|| format!("live_replay_game_index_out_of_range={game_index}"))?;
-    if frame_slot >= storage.frame_slots_per_game {
-        return Err(format!(
-            "live_replay_frame_slot_overflow={game_index}; slot={}",
-            frame_slot
-        ));
+    if game_index >= storage.game_count {
+        return Err(format!("live_replay_game_index_out_of_range={game_index}"));
     }
     let mut bytes = Vec::new();
+    bytes.push(LIVE_REPLAY_RECORD_FRAME);
+    push_usize_as_u32(&mut bytes, game_index, "live_replay_frame_game")?;
     push_replay_frame_binary(&mut bytes, frame)?;
-    if bytes.len() > storage.frame_slot_bytes {
-        return Err(format!(
-            "live_replay_frame_too_large={}; slot_bytes={}",
-            bytes.len(),
-            storage.frame_slot_bytes
-        ));
-    }
-    let offset = live_replay_frame_slot_offset(storage, game_index, frame_slot)?;
-    let mut slot_bytes = Vec::with_capacity(LIVE_REPLAY_SLOT_LENGTH_BYTES + bytes.len());
-    push_usize_as_u32(
-        &mut slot_bytes,
-        bytes.len(),
-        "live_replay_frame_payload_len",
-    )?;
-    slot_bytes.extend_from_slice(&bytes);
-    write_binary_at_with_retries(
+    append_binary_with_retries(
         Path::new(&storage.file_path),
-        offset,
-        &slot_bytes,
-        "live_replay_slot_write_failed",
+        &bytes,
+        "live_replay_append_frame_failed",
     )?;
-    storage.next_frame_slots[game_index] = frame_slot + 1;
     storage.frame_count += 1;
     Ok(())
 }
@@ -5145,58 +5068,22 @@ fn append_live_replay_result(
     rewards: &[i32; MAX_PLAYER_SLOTS],
     active_player_count: usize,
 ) -> Result<(), String> {
+    if game_index >= storage.game_count {
+        return Err(format!("live_replay_game_index_out_of_range={game_index}"));
+    }
     let mut bytes = Vec::new();
+    bytes.push(LIVE_REPLAY_RECORD_RESULT);
+    push_usize_as_u32(&mut bytes, game_index, "live_replay_result_game")?;
     let reward_count = active_player_count.min(storage.active_player_count);
     push_usize_as_u32(&mut bytes, reward_count, "live_replay_result_reward_count")?;
     for reward in rewards.iter().take(reward_count) {
         push_i32(&mut bytes, *reward);
     }
-    let offset = live_replay_result_slot_offset(storage, game_index)?;
-    write_binary_at_with_retries(
+    append_binary_with_retries(
         Path::new(&storage.file_path),
-        offset,
         &bytes,
-        "live_replay_result_slot_write_failed",
+        "live_replay_append_result_failed",
     )
-}
-
-fn live_replay_frame_slot_offset(
-    storage: &LiveReplayStorage,
-    game_index: usize,
-    frame_slot: usize,
-) -> Result<u64, String> {
-    let per_slot_bytes = LIVE_REPLAY_SLOT_LENGTH_BYTES + storage.frame_slot_bytes;
-    let slot_index = game_index
-        .checked_mul(storage.frame_slots_per_game)
-        .and_then(|value| value.checked_add(frame_slot))
-        .ok_or_else(|| "live_replay_slot_index_overflow".to_string())?;
-    let byte_offset = slot_index
-        .checked_mul(per_slot_bytes)
-        .ok_or_else(|| "live_replay_slot_byte_offset_overflow".to_string())?;
-    storage
-        .frame_base_offset
-        .checked_add(
-            u64::try_from(byte_offset)
-                .map_err(|_| "live_replay_slot_offset_overflow".to_string())?,
-        )
-        .ok_or_else(|| "live_replay_slot_offset_overflow".to_string())
-}
-
-fn live_replay_result_slot_offset(
-    storage: &LiveReplayStorage,
-    game_index: usize,
-) -> Result<u64, String> {
-    let per_result_bytes = LIVE_REPLAY_SLOT_LENGTH_BYTES + storage.active_player_count * 4;
-    let byte_offset = game_index
-        .checked_mul(per_result_bytes)
-        .ok_or_else(|| "live_replay_result_offset_overflow".to_string())?;
-    storage
-        .result_base_offset
-        .checked_add(
-            u64::try_from(byte_offset)
-                .map_err(|_| "live_replay_result_offset_overflow".to_string())?,
-        )
-        .ok_or_else(|| "live_replay_result_offset_overflow".to_string())
 }
 
 fn push_replay_frame_binary(buffer: &mut Vec<u8>, frame: &ReplayFrame) -> Result<(), String> {
@@ -5269,10 +5156,6 @@ fn push_i32(buffer: &mut Vec<u8>, value: i32) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
 
-fn push_u64(buffer: &mut Vec<u8>, value: u64) {
-    buffer.extend_from_slice(&value.to_le_bytes());
-}
-
 fn push_f32(buffer: &mut Vec<u8>, value: f32) {
     buffer.extend_from_slice(&value.to_le_bytes());
 }
@@ -5300,45 +5183,18 @@ fn write_binary_with_retries(
     Err(format!("{error_prefix}={error}"))
 }
 
-fn set_file_len_with_retries(path: &Path, len: u64, error_prefix: &str) -> Result<(), String> {
-    let mut last_error = None;
-    for attempt in 0..TELEMETRY_WRITE_ATTEMPTS {
-        match OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(path)
-            .and_then(|file| file.set_len(len))
-        {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                last_error = Some(error);
-                if attempt + 1 < TELEMETRY_WRITE_ATTEMPTS {
-                    std::thread::sleep(Duration::from_millis(TELEMETRY_WRITE_RETRY_DELAY_MS));
-                }
-            }
-        }
-    }
-    let error = last_error
-        .map(|error| error.to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    Err(format!("{error_prefix}={error}"))
-}
-
-fn write_binary_at_with_retries(
+fn append_binary_with_retries(
     path: &Path,
-    offset: u64,
     contents: &[u8],
     error_prefix: &str,
 ) -> Result<(), String> {
     let mut last_error = None;
     for attempt in 0..TELEMETRY_WRITE_ATTEMPTS {
         match OpenOptions::new()
-            .write(true)
+            .append(true)
             .open(path)
-            .and_then(|mut file| {
-                file.seek(SeekFrom::Start(offset))?;
-                file.write_all(contents)
-            }) {
+            .and_then(|mut file| file.write_all(contents))
+        {
             Ok(()) => return Ok(()),
             Err(error) => {
                 last_error = Some(error);
@@ -5404,7 +5260,21 @@ fn compact_live_slot_to_owlive_from_replay_games(
     replay_games: &[ReplayGame],
     active_player_count: usize,
 ) -> Result<Option<LiveReplayCompactionStats>, String> {
-    let slot_path_string = live_replay_file_path(run_id, generation);
+    let append_path_string = live_replay_file_path(run_id, generation);
+    let append_path = Path::new(&append_path_string);
+    if append_path.exists() {
+        let compact_bytes = append_path
+            .metadata()
+            .map_err(|error| format!("live_replay_append_metadata_failed={error}"))?
+            .len();
+        let actual_games = replay_actual_games(replay_games);
+        return Ok(Some(LiveReplayCompactionStats {
+            game_count: actual_games.len(),
+            compact_bytes,
+            source: "append",
+        }));
+    }
+    let slot_path_string = legacy_live_replay_slot_file_path(run_id, generation);
     let slot_path = Path::new(&slot_path_string);
     if !slot_path.exists() {
         return Ok(None);
@@ -5413,7 +5283,7 @@ fn compact_live_slot_to_owlive_from_replay_games(
     if actual_games.is_empty() {
         return Ok(None);
     }
-    let compact_path_string = legacy_live_replay_file_path(run_id, generation);
+    let compact_path_string = live_replay_file_path(run_id, generation);
     let compact_path = Path::new(&compact_path_string);
     if let Some(parent) = compact_path.parent() {
         fs::create_dir_all(parent)
@@ -5503,6 +5373,7 @@ fn compact_live_slot_to_owlive_from_replay_games(
         game_count: actual_games.len(),
         compact_bytes: u64::try_from(bytes.len())
             .map_err(|_| "live_replay_compact_size_overflow".to_string())?,
+        source: "owslot",
     }))
 }
 
@@ -5663,19 +5534,15 @@ fn replay_game_public_path(run_id: &str, generation: usize, game_index: usize) -
 }
 
 fn live_replay_file_path(run_id: &str, generation: usize) -> String {
-    format!("dashboard/public/telemetry/live_{run_id}_generation_{generation}.owslot")
-}
-
-fn live_replay_public_path(run_id: &str, generation: usize) -> String {
-    format!("/telemetry/live_{run_id}_generation_{generation}.owslot")
-}
-
-fn legacy_live_replay_file_path(run_id: &str, generation: usize) -> String {
     format!("dashboard/public/telemetry/live_{run_id}_generation_{generation}.owlive")
 }
 
-fn legacy_live_replay_public_path(run_id: &str, generation: usize) -> String {
+fn live_replay_public_path(run_id: &str, generation: usize) -> String {
     format!("/telemetry/live_{run_id}_generation_{generation}.owlive")
+}
+
+fn legacy_live_replay_slot_file_path(run_id: &str, generation: usize) -> String {
+    format!("dashboard/public/telemetry/live_{run_id}_generation_{generation}.owslot")
 }
 
 fn model_selected(
@@ -6149,6 +6016,74 @@ mod tests {
         assert!(game_view_counts
             .values()
             .all(|count| *count == PLAYER_COUNT_FOUR));
+    }
+
+    #[test]
+    fn live_replay_storage_is_append_only_owlive() {
+        const LIVE_APPEND_TEST_GENERATION: usize = 900_001;
+        const LIVE_APPEND_TEST_RUN_ID: &str = "test_live_append_storage";
+        let config = AgentConfig::default();
+        let live_path_string =
+            live_replay_file_path(LIVE_APPEND_TEST_RUN_ID, LIVE_APPEND_TEST_GENERATION);
+        let slot_path_string =
+            legacy_live_replay_slot_file_path(LIVE_APPEND_TEST_RUN_ID, LIVE_APPEND_TEST_GENERATION);
+        let live_path = Path::new(&live_path_string);
+        let slot_path = Path::new(&slot_path_string);
+        let _ = fs::remove_file(live_path);
+        let _ = fs::remove_file(slot_path);
+        let state =
+            seeded_state(&config, PLAYER_COUNT_FOUR, LIVE_APPEND_TEST_GENERATION, 0).unwrap();
+        let frame = replay_frame_from_state(&state);
+        let active_game = ActiveGame {
+            assignment: GameAssignment {
+                model_indices: [0, 1, 2, 3],
+            },
+            state,
+            frames: Vec::new(),
+            stats: ComputeStats::default(),
+            gameplay: [GameplayStats::default(); MAX_PLAYER_SLOTS],
+            rewards: [config.training_reward_draw; MAX_PLAYER_SLOTS],
+            fleet_action_traces: BTreeMap::new(),
+            completed: false,
+            started_at: Instant::now(),
+        };
+
+        let mut storage = create_live_replay_storage(
+            LIVE_APPEND_TEST_GENERATION,
+            &[active_game],
+            1,
+            PLAYER_COUNT_FOUR,
+            LIVE_APPEND_TEST_RUN_ID,
+            &config,
+        )
+        .unwrap();
+        assert!(storage.public_path.ends_with(".owlive"));
+        assert!(!slot_path.exists());
+        let header = fs::read(live_path).unwrap();
+        assert!(header.starts_with(LIVE_REPLAY_BINARY_MAGIC));
+        assert_eq!(
+            header[LIVE_REPLAY_BINARY_MAGIC.len()],
+            LIVE_REPLAY_RECORD_HEADER
+        );
+        let header_len = fs::metadata(live_path).unwrap().len();
+        assert!(header_len < config.dashboard_live_replay_slot_bytes as u64);
+
+        append_live_replay_frame(&mut storage, 0, &frame).unwrap();
+        let frame_len = fs::metadata(live_path).unwrap().len();
+        assert!(frame_len > header_len);
+        assert!(frame_len < config.dashboard_live_replay_slot_bytes as u64);
+
+        append_live_replay_result(
+            &storage,
+            0,
+            &[config.training_reward_draw; MAX_PLAYER_SLOTS],
+            PLAYER_COUNT_FOUR,
+        )
+        .unwrap();
+        let result_len = fs::metadata(live_path).unwrap().len();
+        assert!(result_len > frame_len);
+
+        let _ = fs::remove_file(live_path);
     }
 
     #[test]

@@ -170,7 +170,7 @@ git commit -m "perf: trim trainer hot-loop allocations"
 **Files:**
 - No source changes.
 
-- [ ] **Step 1: Check remote**
+- [x] **Step 1: Check remote**
 
 Run:
 
@@ -178,9 +178,9 @@ Run:
 git remote -v
 ```
 
-Expected: if `origin` is missing, stop and ask for the GitHub repository URL or permission to create one under the authenticated account.
+Result: `origin` was missing; user approved creating a private GitHub repository.
 
-- [ ] **Step 2: Push when remote exists**
+- [x] **Step 2: Push when remote exists**
 
 Run:
 
@@ -188,7 +188,7 @@ Run:
 git push -u origin codex/perf-memory-first-pass
 ```
 
-Expected: branch is visible on GitHub.
+Result: private repository `TryDotAtwo/Orbit-Wars-2D-Transformer` created and branch `codex/perf-memory-first-pass` pushed.
 
 ### Task 6: CUDA Forward Packing Scratch
 
@@ -223,3 +223,31 @@ docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05
 ```
 
 Expected: all Rust tests pass.
+
+### Task 7: Split Live And Completed Replay Storage
+
+**Files:**
+- Modify: `crates/orbit-wars-trainer/src/main.rs`
+- Modify: `dashboard/src/App.tsx`
+- Modify: `dashboard/src/sampleData.ts`
+- Register: `test_results/2026-06-03_live_completed_replay_storage_split.md`
+
+- [x] **Step 1: Make live storage append-only**
+
+Replaced new live replay `.owslot` preallocation with append-only `.owlive` records. Kept old `.owslot` cleanup/compaction support for existing artifacts.
+
+- [x] **Step 2: Keep dashboard polling lightweight**
+
+Changed dashboard polling to load `latest.json` only. Active live replay uses lightweight `frames` and metadata there; completed replay chunks remain lazy generation/game loads.
+
+- [x] **Step 3: Verify**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo fmt --all && cargo test --workspace"
+cd dashboard
+npm.cmd run build
+```
+
+Expected: Rust workspace and dashboard production build pass.

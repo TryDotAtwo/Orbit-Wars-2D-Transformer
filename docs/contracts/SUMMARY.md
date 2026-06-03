@@ -1,8 +1,8 @@
 # docs/contracts/SUMMARY.md
 
-timestamp=2026-06-03T16:16:09+03:00
+timestamp=2026-06-03T17:50:52+03:00
 section=contracts
-active_task_id=2026-06-03_docs_cleanup
+active_task_id=2026-06-03_live_completed_replay_storage_split
 
 ## Purpose
 
@@ -76,8 +76,9 @@ active_task_id=2026-06-03_docs_cleanup
 - Consumer: dashboard.
 - Dashboard never mutates trainer state.
 - `latest.json` must remain lightweight and must not embed completed full replay frames.
-- Active live replay uses live replay path metadata.
-- Completed replay chunks are durable generation artifacts and loaded lazily.
+- Active live replay is a different contract from completed replay: `latest.json` carries current lightweight frames/metadata, and the trainer writes a growing append-only `.owlive` artifact.
+- Dashboard polling must not bulk-load active live replay artifacts; full replay artifact loading is allowed only through lazy replay/chunk paths.
+- Completed replay chunks are immutable durable generation artifacts and loaded lazily by generation/game.
 - Metrics arrays must describe completed generations only; active generation progress belongs in top-level live fields.
 - Generation winrate rows must be deduplicated by `(validationGeneration, evaluatedGeneration)`.
 - Compact generation logs store aggregate counters and timings, not frames, per-turn state, or trajectory samples.

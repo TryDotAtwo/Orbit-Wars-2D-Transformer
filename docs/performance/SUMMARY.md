@@ -1,8 +1,8 @@
 # docs/performance/SUMMARY.md
 
-timestamp=2026-06-03T17:43:00+03:00
+timestamp=2026-06-03T17:50:52+03:00
 section=performance
-active_task_id=2026-06-03_population_forward_scratch
+active_task_id=2026-06-03_live_completed_replay_storage_split
 
 ## Current Facts
 
@@ -12,10 +12,12 @@ active_task_id=2026-06-03_population_forward_scratch
 - CUDA training no longer uses `atomicAdd`; shared gradients use explicit reductions.
 - Live and completed replay storage were changed to avoid giant repeated JSON polling.
 - Dashboard replay chunks are loaded lazily; non-Replay tabs should fetch lightweight telemetry only.
+- Live replay storage now writes append-only `.owlive` records instead of preallocating `.owslot` frame slots; dashboard polling uses `latest.json` frames and does not bulk-load the growing live file.
 - Current 64-model/20-participation generations are measured but slow: generation 58 took about 1249 s, generation 59 about 1288 s, generation 60 about 1398 s.
 - Dashboard production build no longer copies runtime telemetry into `dist`; `npm.cmd run build` produced a 245,917 byte payload after `build.copyPublicDir=false`.
 - Trainer hot-loop cleanup removed one per-turn `requests_per_game` allocation and per-turn/per-model sample-index vector allocation; behavior is covered by `test_results/2026-06-03_hot_loop_allocation_cleanup.md`.
 - CUDA resident population forward packing now reuses host `input_rows` and `model_indices` scratch buffers across turns/chunks; behavior is covered by `test_results/2026-06-03_population_forward_scratch.md`.
+- Live/completed replay storage split is covered by `test_results/2026-06-03_live_completed_replay_storage_split.md`.
 
 ## Active Bottlenecks
 
@@ -25,7 +27,7 @@ active_task_id=2026-06-03_population_forward_scratch
 - Backprop is correct on smokes but still needs tiled/shared-memory/tensor-core optimization for stable full-run throughput.
 - GPU utilization telemetry is not a real measured occupancy metric unless separately collected.
 - Broad 65,536-game batch target is not proven.
-- Host-side request packing, decoding, per-turn worker spawning, and telemetry/replay file handling remain likely material overheads around CUDA bursts.
+- Host-side request packing, decoding, per-turn worker spawning, and completed replay artifact handling remain likely material overheads around CUDA bursts.
 - Runtime telemetry still lives under `dashboard/public/telemetry` for dev serving; it remains about 10+ GB and should be managed separately from source/build outputs.
 
 ## Measurements To Run Next

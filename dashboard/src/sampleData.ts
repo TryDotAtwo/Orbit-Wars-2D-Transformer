@@ -15,12 +15,6 @@ type IndexedReplayGameManifest = {
   frameCount: number;
 };
 
-type LoadTelemetryOptions = {
-  includeLiveReplay?: boolean;
-};
-
-const LIVE_REPLAY_FORMAT = 'orbit_live_replay_v1';
-const LIVE_REPLAY_SLOT_FORMAT = 'orbit_live_replay_slots_v1';
 const LIVE_REPLAY_MAGIC = 'OWLIVE1\n';
 const LIVE_REPLAY_SLOT_MAGIC = 'OWSLOT1\n';
 const LIVE_REPLAY_RECORD_HEADER = 1;
@@ -128,7 +122,7 @@ export const sampleTelemetry: DashboardTelemetry = {
   warnings: ['sample_data_not_training_artifact'],
 };
 
-export async function loadTelemetry(options: LoadTelemetryOptions = {}): Promise<DashboardTelemetry> {
+export async function loadTelemetry(): Promise<DashboardTelemetry> {
   try {
     const response = await fetch('/telemetry/latest.json', { cache: 'no-store' });
     if (!response.ok) {
@@ -136,21 +130,13 @@ export async function loadTelemetry(options: LoadTelemetryOptions = {}): Promise
     }
     const artifact = await response.json();
     const manifestReplayGames = (artifact.replayGames ?? []).map(hydrateReplayGame);
-    const liveReplayWarnings: string[] = [];
-    const liveReplayGames = options.includeLiveReplay
-      ? await loadLiveReplayGames(artifact).catch((error) => {
-          liveReplayWarnings.push(`live_replay_load_failed=${String(error)}`);
-          return [] as ReplayGame[];
-        })
-      : [];
-    const replayGames = liveReplayGames.length > 0 ? liveReplayGames : manifestReplayGames;
+    const replayGames = manifestReplayGames;
     const artifactFrames = (artifact.frames ?? []).map(hydrateFrame);
-    const frames = liveReplayGames[0]?.frames ?? artifactFrames;
     return {
       ...sampleTelemetry,
       ...artifact,
       replayGames,
-      frames,
+      frames: artifactFrames,
       metrics: completedMetrics(artifact.metrics ?? [], artifact.activeGeneration).map(hydrateMetric),
       generationWinRates: dedupGenerationWinRates(artifact.generationWinRates ?? []),
       models: (artifact.models ?? []).map(hydrateModel),
@@ -168,8 +154,8 @@ export async function loadTelemetry(options: LoadTelemetryOptions = {}): Promise
       maxInferenceBatchSize: artifact.maxInferenceBatchSize ?? sampleTelemetry.maxInferenceBatchSize,
       liveReplayFormat: artifact.liveReplayFormat,
       liveReplayPath: artifact.liveReplayPath,
-      liveReplayFrameCount: artifact.liveReplayFrameCount ?? liveReplayGames[0]?.frames.length,
-      warnings: [...(artifact.warnings ?? []), ...liveReplayWarnings],
+      liveReplayFrameCount: artifact.liveReplayFrameCount,
+      warnings: artifact.warnings ?? [],
       source: 'artifact',
       sourceMessage: artifact.sourceMessage ?? 'loaded from /telemetry/latest.json',
     };
@@ -237,24 +223,6 @@ type LiveReplayGameMeta = {
   participants: LiveReplayParticipant[];
   frames: ReplayFrame[];
 };
-
-async function loadLiveReplayGames(artifact: any): Promise<ReplayGame[]> {
-  if (
-    (artifact.liveReplayFormat !== LIVE_REPLAY_FORMAT && artifact.liveReplayFormat !== LIVE_REPLAY_SLOT_FORMAT) ||
-    !artifact.liveReplayPath
-  ) {
-    return [];
-  }
-  if (artifact.liveReplayFormat === LIVE_REPLAY_SLOT_FORMAT) {
-    return [];
-  }
-  const response = await fetch(artifact.liveReplayPath, { cache: 'no-store' });
-  if (!response.ok) {
-    throw new Error(`live_replay_fetch_failed=${artifact.liveReplayPath}`);
-  }
-  const buffer = await response.arrayBuffer();
-  return decodeLiveReplay(buffer);
-}
 
 function decodeLiveReplay(buffer: ArrayBuffer): ReplayGame[] {
   const reader = new LiveReplayBinaryReader(buffer);

@@ -1,8 +1,8 @@
 # PROJECT_MEMORY.md
 
-timestamp=2026-06-03T17:43:00+03:00
+timestamp=2026-06-03T17:50:52+03:00
 project_state=performance_memory_first_pass
-active_task_id=2026-06-03_population_forward_scratch
+active_task_id=2026-06-03_live_completed_replay_storage_split
 
 ## Working Rule
 
@@ -48,12 +48,13 @@ active_task_id=2026-06-03_population_forward_scratch
 - full_training_target=4 players, population 64, 20 participations per model, top 6 selected, 320 actual games per generation.
 - weighted_reproduction=selected parent slots weighted by smoothed winrate plus normalized reward, bounded by configured min/max slots.
 - generation_archive=top 4 models per generation, at most 32 generations, interval-32 tournament.
-- dashboard_replay_policy=4 actual evaluation games per completed generation; live replay uses preallocated slot storage; completed replay payloads are loaded lazily.
+- dashboard_replay_policy=live replay is a lightweight current-progress feed plus append-only `.owlive` artifact; completed replay chunks are immutable durable artifacts loaded lazily by generation/game.
 
 ## Latest Verified Work
 
 - `test_results/2026-06-03_docs_cleanup.md`: root memory, navigation index, and section summaries compacted for agent work; docs-only sanity checks passed.
 - `test_results/2026-06-03_simplify_agent_rules.md`: `AGENTS.md` and related docs changed from mandatory blanket loading/registration to a lightweight, judgment-based route.
+- `test_results/2026-06-03_live_completed_replay_storage_split.md`: live replay storage changed from preallocated `.owslot` to append-only `.owlive`; dashboard polling no longer bulk-loads live replay files; Rust, dashboard build, and browser checks passed.
 - `test_results/2026-06-03_population_forward_scratch.md`: CUDA resident population forward packing now reuses host input/model-index scratch buffers; full Rust workspace tests passed.
 - `test_results/2026-06-03_hot_loop_allocation_cleanup.md`: removed small per-turn trainer allocations; full Rust workspace tests passed.
 - `test_results/2026-06-03_checkpoint_path_config_fix.md`: trainer checkpoint save path now uses explicit `--resume-checkpoint` when present and configured `AgentConfig::trainer_checkpoint_path` otherwise.
@@ -77,7 +78,7 @@ active_task_id=2026-06-03_population_forward_scratch
 - CUDA full-attention backprop is correct on smoke tests but still throughput-sensitive; tiled/shared-memory/tensor-core attention and transfer overlap remain future optimization.
 - GPU utilization telemetry is not a real hardware occupancy metric unless explicitly measured.
 - Current full_500 population=64/top-6 generation timing is slow: recent completed generations were about 1249-1398 seconds.
-- Runtime telemetry remains large under `dashboard/public/telemetry`, but production build no longer copies it into `dist`.
+- Runtime telemetry remains large under `dashboard/public/telemetry`, but production build no longer copies it into `dist`; new live replay artifacts avoid `.owslot` preallocation.
 - Sun-blocked routes are intentionally not hidden by decoder; learning signal comes from action-local penalties.
 - Large runtime artifacts may exist under ignored paths; do not stage or delete them blindly.
 

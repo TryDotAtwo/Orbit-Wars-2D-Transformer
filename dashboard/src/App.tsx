@@ -110,7 +110,7 @@ export function App() {
   useEffect(() => {
     let mounted = true;
     const refreshTelemetry = () => {
-      loadTelemetry({ includeLiveReplay: activeTab === TAB_REPLAY }).then((loadedTelemetry) => {
+      loadTelemetry().then((loadedTelemetry) => {
         if (mounted) {
           setTelemetry(loadedTelemetry);
         }
@@ -122,7 +122,7 @@ export function App() {
       mounted = false;
       window.clearInterval(interval);
     };
-  }, [activeTab]);
+  }, []);
 
   useEffect(() => {
     setSelectedReplayIndex(0);

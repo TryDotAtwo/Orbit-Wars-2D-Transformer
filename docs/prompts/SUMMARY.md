@@ -1,8 +1,8 @@
 # docs/prompts/SUMMARY.md
 
-timestamp=2026-06-03T17:12:00+03:00
+timestamp=2026-06-03T17:50:52+03:00
 section=prompts
-active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
+active_task_id=2026-06-03_live_completed_replay_storage_split
 
 ## Policy
 
@@ -13,6 +13,8 @@ active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 ## Current Registration
 
+- `prompt_history/20260603_175000_keep_dashboard_running.md`: user requested keeping the dashboard up for observing current training while work continues.
+- `prompt_history/20260603_174000_create_private_github_repo.md`: user requested creating a private GitHub repository for the project.
 - `prompt_history/20260603_170612_perf_memory_github_plugins_request.md`: user requested plugin-assisted performance/memory work, incremental Git/GitHub commits, Codex-centered implementation, and no functionality cuts.
 - `prompt_history/20260603_163041_nvidia_perf_bug_review_no_code_changes.md`: user requested no-code-change project/code/performance review and explicit NVIDIA plugin use.
 - `prompt_history/20260603_162321_simplify_agent_rules.md`: user requested simplifying `AGENTS.md` and related workflow docs because the protocol still felt obstructive.
@@ -28,5 +30,5 @@ active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 ## Result Status
 
-- latest_prompt_status=performance_memory_first_pass_in_progress.
+- latest_prompt_status=live_completed_replay_split_in_progress.
 - full prompt history remains in `prompt_history/`.
