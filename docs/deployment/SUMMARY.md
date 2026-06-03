@@ -1,8 +1,8 @@
 # docs/deployment/SUMMARY.md
 
-timestamp=2026-06-03T16:16:09+03:00
+timestamp=2026-06-03T17:22:00+03:00
 section=deployment
-active_task_id=2026-06-03_docs_cleanup
+active_task_id=2026-06-03_checkpoint_path_config_fix
 
 ## Current Environment
 
@@ -43,7 +43,7 @@ npm.cmd run build
 - Before stopping or replacing a trainer, verify live PID, checkpoint generation, and telemetry state.
 - Use checkpoint-boundary restart tooling when preserving progress matters.
 - Detached trainer launches should tee stdout/stderr into both artifact log and `/proc/1/fd/1` so `docker logs` remains useful.
-- Current checkpoint path is configured in `project_config.yaml`; do not hardcode a new checkpoint path in code.
+- Current checkpoint path is mirrored by `project_config.yaml` and `AgentConfig::trainer_checkpoint_path`; trainer saves to the explicit `--resume-checkpoint` path when supplied, otherwise to the configured path.
 
 ## Submission Operations
 

@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T17:12:00+03:00
+timestamp=2026-06-03T17:22:00+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
+active_task_id=2026-06-03_checkpoint_path_config_fix
 
 ## How To Use This Index
 
@@ -47,7 +47,7 @@ active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 | path | public surface |
 |---|---|
 | `crates/orbit-wars-core/src/lib.rs` | Exports config, encoder, decoder, geometry, simulator, and model types. |
-| `crates/orbit-wars-core/src/config.rs` | `AgentConfig` and named constants mirrored from `project_config.yaml`. |
+| `crates/orbit-wars-core/src/config.rs` | `AgentConfig`, including `trainer_checkpoint_path`, and named constants mirrored from `project_config.yaml`. |
 | `crates/orbit-wars-core/src/types.rs` | `Planet`, `Fleet`, `RowFeature`, `ActionTargetOutput`, `ActionOutput`, `MoveCommand`. |
 | `crates/orbit-wars-core/src/encoder.rs` | `encode_state`, row ordering, owner-class mapping, `64x7` input construction. |
 | `crates/orbit-wars-core/src/decoder.rs` | `decode_model_outputs`, trace decoder, post-output aiming and command filtering. |
@@ -128,6 +128,7 @@ active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 | `prompt_history/20260603_170612_perf_memory_github_plugins_request.md` | Raw user prompt requesting plugin-assisted performance/memory work with incremental GitHub commits. |
 | `docs/superpowers/plans/2026-06-03-performance-memory-first-pass.md` | Superpowers implementation plan for the first performance/memory pass. |
 | `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md` | Dashboard production build verification after preventing runtime telemetry copy into `dist`. |
+| `test_results/2026-06-03_checkpoint_path_config_fix.md` | Red/green verification for config/resume-aware trainer checkpoint save path. |
 
 ## Search Hints
 

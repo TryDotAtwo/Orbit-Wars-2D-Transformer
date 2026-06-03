@@ -1,8 +1,8 @@
 # PROJECT_MEMORY.md
 
-timestamp=2026-06-03T17:12:00+03:00
+timestamp=2026-06-03T17:22:00+03:00
 project_state=performance_memory_first_pass
-active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
+active_task_id=2026-06-03_checkpoint_path_config_fix
 
 ## Working Rule
 
@@ -54,6 +54,7 @@ active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
 
 - `test_results/2026-06-03_docs_cleanup.md`: root memory, navigation index, and section summaries compacted for agent work; docs-only sanity checks passed.
 - `test_results/2026-06-03_simplify_agent_rules.md`: `AGENTS.md` and related docs changed from mandatory blanket loading/registration to a lightweight, judgment-based route.
+- `test_results/2026-06-03_checkpoint_path_config_fix.md`: trainer checkpoint save path now uses explicit `--resume-checkpoint` when present and configured `AgentConfig::trainer_checkpoint_path` otherwise.
 - `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md`: dashboard production build no longer copies runtime telemetry; `npm.cmd run build` passed and `dist/telemetry` was absent.
 - `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md`: no-code-change project/code/performance review; Docker Rust tests passed, Python syntax checks passed, dashboard build failed on telemetry copy `ENOSPC`, current full_500 timing is slow.
 - `test_results/2026-06-03_population64_games20_top6_weighted_repro.md`: population 64, gamesPerModel 20, top-6 weighted reproduction, checkpoint population shrink support; `cargo fmt --all`, `cargo test --workspace`, and release trainer build passed.

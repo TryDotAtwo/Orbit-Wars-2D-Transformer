@@ -73,6 +73,8 @@ pub const TRAINING_REPRODUCTION_MAX_SLOTS_PER_ELITE: usize = 18;
 pub const TRAINING_REPRODUCTION_WINRATE_SMOOTHING_WINS: f32 = 1.0;
 pub const TRAINING_REPRODUCTION_WINRATE_SMOOTHING_GAMES: f32 = 2.0;
 pub const GENERATION_TOURNAMENT_KAGGLE_STAGE_FOR_HOST_SUBMIT: bool = true;
+pub const TRAINER_CHECKPOINT_PATH: &str =
+    "artifacts/full_training_2026-06-01_self_train_current_contract.checkpoint.bin";
 pub const KAGGLE_COMPETITION_SLUG: &str = "orbit-wars";
 pub const KAGGLE_SUBMISSION_STAGE_DIR: &str = "artifacts/kaggle_auto_submit";
 pub const KAGGLE_SUBMISSION_MAIN_PATH: &str = "kaggle_submission/main.py";
@@ -177,6 +179,7 @@ pub struct AgentConfig {
     pub training_reproduction_winrate_smoothing_wins: f32,
     pub training_reproduction_winrate_smoothing_games: f32,
     pub generation_tournament_kaggle_stage_for_host_submit: bool,
+    pub trainer_checkpoint_path: &'static str,
     pub kaggle_competition_slug: &'static str,
     pub kaggle_submission_stage_dir: &'static str,
     pub kaggle_submission_main_path: &'static str,
@@ -286,6 +289,7 @@ impl Default for AgentConfig {
                 TRAINING_REPRODUCTION_WINRATE_SMOOTHING_GAMES,
             generation_tournament_kaggle_stage_for_host_submit:
                 GENERATION_TOURNAMENT_KAGGLE_STAGE_FOR_HOST_SUBMIT,
+            trainer_checkpoint_path: TRAINER_CHECKPOINT_PATH,
             kaggle_competition_slug: KAGGLE_COMPETITION_SLUG,
             kaggle_submission_stage_dir: KAGGLE_SUBMISSION_STAGE_DIR,
             kaggle_submission_main_path: KAGGLE_SUBMISSION_MAIN_PATH,
@@ -440,6 +444,7 @@ impl AgentConfig {
                 .training_reproduction_winrate_smoothing_games
                 .is_finite()
             || self.training_reproduction_winrate_smoothing_games <= 0.0
+            || self.trainer_checkpoint_path.is_empty()
             || self.kaggle_competition_slug.is_empty()
             || self.kaggle_submission_stage_dir.is_empty()
             || self.kaggle_submission_main_path.is_empty()

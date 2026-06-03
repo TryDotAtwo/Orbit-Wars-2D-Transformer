@@ -69,8 +69,6 @@ const LIVE_REPLAY_RECORD_RESULT: u8 = 3;
 const TRAINER_CHECKPOINT_MAGIC: &[u8] = b"OWTRAIN1";
 const TRAINER_CHECKPOINT_VERSION: u32 = 1;
 const GENERATION_TOP_MODELS_MAGIC: &[u8] = b"OWTOP4_1";
-const DEFAULT_TRAINER_CHECKPOINT_PATH: &str =
-    "artifacts/full_training_2026-06-01_self_train_current_contract.checkpoint.bin";
 const LIVE_REPLAY_SLOT_MAGIC: &[u8] = b"OWSLOT1\n";
 const LIVE_REPLAY_SLOT_LENGTH_BYTES: usize = 4;
 const KAGGLE_SUBMISSION_MAIN_FILE: &str = "main.py";
@@ -584,7 +582,7 @@ fn main() -> Result<(), String> {
         &run_id,
     )?;
     save_trainer_checkpoint(
-        DEFAULT_TRAINER_CHECKPOINT_PATH,
+        trainer_checkpoint_save_path(&cli, &agent_config),
         &run_id,
         start_generation,
         &population,
@@ -896,7 +894,7 @@ fn main() -> Result<(), String> {
             &run_id,
         )?;
         save_trainer_checkpoint(
-            DEFAULT_TRAINER_CHECKPOINT_PATH,
+            trainer_checkpoint_save_path(&cli, &agent_config),
             &run_id,
             generation + 1,
             &population,
@@ -976,6 +974,12 @@ fn flush_stdout() -> Result<(), String> {
     stdout
         .flush()
         .map_err(|error| format!("trainer_stdout_flush_failed={error}"))
+}
+
+fn trainer_checkpoint_save_path<'a>(cli: &'a TrainerCli, config: &'a AgentConfig) -> &'a str {
+    cli.resume_checkpoint
+        .as_deref()
+        .unwrap_or(config.trainer_checkpoint_path)
 }
 
 fn parse_trainer_cli(args: &[String]) -> Result<TrainerCli, String> {
@@ -5952,6 +5956,44 @@ mod tests {
     fn default_training_player_count_is_four_player() {
         let config = AgentConfig::default();
         assert_eq!(config.training_players_per_game, PLAYER_COUNT_FOUR);
+    }
+
+    #[test]
+    fn checkpoint_save_path_uses_resume_checkpoint_when_supplied() {
+        let config = AgentConfig::default();
+        let cli = TrainerCli {
+            smoke: false,
+            dashboard_strict: false,
+            use_cuda: true,
+            full_replays: false,
+            player_count_override: None,
+            generation_override: None,
+            resume_checkpoint: Some("artifacts/custom_resume.checkpoint.bin".to_string()),
+        };
+
+        assert_eq!(
+            trainer_checkpoint_save_path(&cli, &config),
+            "artifacts/custom_resume.checkpoint.bin"
+        );
+    }
+
+    #[test]
+    fn checkpoint_save_path_uses_config_default_without_resume() {
+        let config = AgentConfig::default();
+        let cli = TrainerCli {
+            smoke: false,
+            dashboard_strict: false,
+            use_cuda: true,
+            full_replays: false,
+            player_count_override: None,
+            generation_override: None,
+            resume_checkpoint: None,
+        };
+
+        assert_eq!(
+            trainer_checkpoint_save_path(&cli, &config),
+            config.trainer_checkpoint_path
+        );
     }
 
     #[test]

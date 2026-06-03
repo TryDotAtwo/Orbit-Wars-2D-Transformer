@@ -1,8 +1,8 @@
 # docs/testing/SUMMARY.md
 
-timestamp=2026-06-03T17:12:00+03:00
+timestamp=2026-06-03T17:22:00+03:00
 section=testing
-active_task_id=2026-06-03_dashboard_build_telemetry_copy_fix
+active_task_id=2026-06-03_checkpoint_path_config_fix
 
 ## Purpose
 
@@ -34,6 +34,7 @@ npm.cmd run build
 
 ## Latest Records
 
+- `test_results/2026-06-03_checkpoint_path_config_fix.md`: checkpoint save path helper covered with red/green targeted trainer tests; `cargo fmt --all` passed.
 - `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md`: dashboard production build passes after disabling public-dir copy; `dist/telemetry` is absent and `dist` payload is about 246 KB.
 - `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md`: no-code-change review; Docker Rust tests and Python syntax checks passed; dashboard build failed on telemetry copy `ENOSPC`.
 - `test_results/2026-06-03_simplify_agent_rules.md`: agent protocol simplification verification.
