@@ -1,0 +1,52 @@
+# Build outputs and dependency caches
+/target/
+/dist/
+/dashboard/dist/
+/dashboard/node_modules/
+/dashboard/.vite/
+node_modules/
+
+# Runtime training artifacts: checkpoints, replays, telemetry, models, logs.
+/artifacts/
+/dashboard/public/telemetry/
+*.checkpoint.bin
+*.checkpoint.tmp
+*.owmodels
+*.owlive
+*.owslot
+*.nsys-rep
+*.ncu-rep
+*.log
+*.pid
+*.tmp
+*.temp
+
+# Packaged/generated native and submission artifacts
+*.so
+*.dll
+*.dylib
+*.a
+*.o
+*.obj
+*.exe
+*.pdb
+*.tar
+*.tar.gz
+*.zip
+/submission.tar.gz
+/kaggle_submission/liborbit_wars_agent.so
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local browser/test scratch
+/.playwright-mcp/
+/orbit-wars-dashboard-*.png
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

@@ -1,0 +1,12 @@
+[workspace]
+members = [
+    "crates/orbit-wars-core",
+    "crates/orbit-wars-ffi",
+    "crates/orbit-wars-trainer",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+version = "0.1.0"

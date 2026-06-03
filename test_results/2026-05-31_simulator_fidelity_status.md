@@ -1,0 +1,10 @@
+timestamp=2026-05-31T20:12:00+03:00
+task_id=2026-05-31_simulator_fidelity_status
+branch=unknown
+commit=unknown
+environment=Windows_PowerShell
+command=`rg -n "reference_compare|official_random_map|simulator|turn_order|comet|swept|passed" docs/testing/SUMMARY.md docs/domain/SUMMARY.md crates/orbit-wars-core/src/simulator.rs tools/orbit_wars_reference_compare.py`
+result=pass
+artifacts=[]
+logs=[]
+conclusion=Status-only check: simulator passed current 5 deterministic official-reference scenarios, but full equivalence to official competition environment across random maps and edge cases is not yet proven.

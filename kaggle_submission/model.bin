@@ -1,0 +1,6 @@
+ORBIT_WARS_MODEL_V1
+mode=true_2d_pair_matrix_transformer
+layers=61
+d_model=32
+heads=4
+seed=17

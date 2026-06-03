@@ -1,0 +1,11 @@
+timestamp=2026-05-31T03:30:00+03:00
+task_id=2026-05-31_true_2d_transformer_requirements
+branch=unknown_unborn_git_head
+commit=unknown_unborn_git_head
+environment=local_powershell_workspace
+command=architecture_explanation_only
+result=not_run
+artifacts=[]
+logs=[]
+inspected_files=[PROJECT_MEMORY.md,docs/architecture/SUMMARY.md,docs/contracts/SUMMARY.md]
+conclusion=A real 2D transformer should preserve and use a two-axis structure internally: spatial grid, row/column factorized attention, two-dimensional positional encoding, or planet-pair relation matrix. Current model has a 64x2 input table but only row attention after projection, so 2D is only input shape wording.

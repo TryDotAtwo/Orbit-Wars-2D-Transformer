@@ -1,0 +1,9 @@
+timestamp=2026-05-31T21:46:00+03:00
+task_id=2026-05-31_full_2d_self_attention_transformer
+agent_id=codex
+source=user
+prompt_raw=Ну вот, хуйня. делай настоящий 2D self-attention. Полний атеншен, то есть 4096*4096 получится у тебя. По сути атеншен позволяет всех со всеми сразу посмотреть одновременно. В этом суть агента. Он на вход получил A*B, где A определяется максимальном числом воможних объектов на карте одновременно (в плане планети + комети) + алаймент для удобства калькулейта, а B определяется числом признаков, которие поместим на вход. Сейчас их 4, + 5-й неявний через положение в таблице. Дальше это идет в табличку A*A. Вход в табличку трансформер учится сам преобразовивать. И вот с табличкой A*A делается настоящий 2д селф-аттеншен, что приводит к 4096*4096 как я понял. А в конце это приводит к виходу A*2, где 2 явних признака это куда и сколько кораблей в процентах нелинейних, и неявное - положение в таблице говорит откуда кидать
+related_files=[crates/orbit-wars-core/src/true2d_model.rs,native/cuda/orbit_wars_cuda.cu,crates/orbit-wars-trainer/src/cuda_true2d.rs,crates/orbit-wars-trainer/src/main.rs,project_config.yaml]
+intended_action=replace_light_attention_with_full_4096x4096_2d_self_attention
+result_status=completed
+result_ref=test_results/2026-05-31_full_2d_self_attention_transformer.md

@@ -1,0 +1,950 @@
+project:
+  id:
+    value: "korabliki_orbit_wars_research"
+    type: string
+    meaning: "project identifier for Kaggle Orbit Wars research workspace"
+  workspace_root:
+    value: "C:/Users/Иван Литвак/Documents/Кораблики"
+    type: path
+    meaning: "project root directory"
+
+competition:
+  slug:
+    value: "orbit-wars"
+    type: string
+    meaning: "Kaggle competition slug"
+  url:
+    value: "https://www.kaggle.com/competitions/orbit-wars"
+    type: url
+    meaning: "official competition URL"
+  official_artifact_dir:
+    value: "artifacts/orbit_wars_official_2026_05_31"
+    type: path
+    meaning: "downloaded official Kaggle files and exported pages"
+
+reference_validation:
+  official_source_dir:
+    value: "C:/tmp/kaggle-env-src"
+    type: path
+    meaning: "local clone of Kaggle/kaggle-environments used for direct Orbit Wars interpreter comparison"
+  official_source_commit:
+    value: "d754e427f2e1862f99d87fac75f3d6568ab8c31d"
+    type: string
+    meaning: "validated Kaggle environments source commit"
+  deterministic_scenario_count:
+    value: 5
+    type: int
+    allowed_min: 1
+    allowed_max: 1000
+    unit: scenarios
+    meaning: "number of deterministic native-versus-official simulator scenarios in reference compare tool"
+
+game_defaults:
+  episode_steps:
+    value: 500
+    type: int
+    allowed_min: 1
+    allowed_max: 10000
+    unit: turns
+    meaning: "maximum game length from official Orbit Wars configuration"
+  act_timeout:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 60
+    unit: seconds
+    meaning: "per-turn agent action timeout from official Orbit Wars configuration"
+  board_size:
+    value: 100.0
+    type: float
+    allowed_min: 1.0
+    allowed_max: 10000.0
+    unit: game_units
+    meaning: "width and height of the square Orbit Wars board"
+  board_center:
+    value: 50.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 10000.0
+    unit: game_units
+    meaning: "center coordinate for orbit rotation and sun position"
+  sun_radius:
+    value: 10.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 100.0
+    unit: game_units
+    meaning: "central sun radius; fleets crossing the sun are destroyed"
+  rotation_radius_limit:
+    value: 50.0
+    type: float
+    allowed_min: 1.0
+    allowed_max: 10000.0
+    unit: game_units
+    meaning: "maximum orbit radius for rotating non-comet planets"
+  ship_speed:
+    value: 6.0
+    type: float
+    allowed_min: 1.0
+    allowed_max: 100.0
+    unit: game_units_per_turn
+    meaning: "maximum fleet speed"
+  fleet_speed_reference_ships:
+    value: 1000.0
+    type: float
+    allowed_min: 2.0
+    allowed_max: 1000000000.0
+    unit: ships
+    meaning: "ship count used as the upper reference for native fleet speed curve"
+  fleet_speed_curve_power:
+    value: 1.5
+    type: float
+    allowed_min: 0.1
+    allowed_max: 10.0
+    meaning: "power applied to log-normalized ship count in native fleet speed curve"
+  comet_speed:
+    value: 4.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 100.0
+    unit: game_units_per_turn
+    meaning: "default comet speed"
+  max_players:
+    value: 4
+    type: int
+    allowed_min: 4
+    allowed_max: 4
+    unit: players
+    meaning: "fixed player owner slots for own plus three enemy class tokens"
+  comet_radius:
+    value: 1.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 100.0
+    unit: game_units
+    meaning: "radius assigned to spawned comet planets in native simulator"
+  comet_production:
+    value: 1.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1000.0
+    unit: ships_per_turn
+    meaning: "production assigned to spawned comet planets in native simulator"
+  fleet_spawn_offset:
+    value: 0.1
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1.0
+    unit: game_units
+    meaning: "official Orbit Wars distance added beyond source planet radius when launching fleets"
+  map_min_planet_groups:
+    value: 5
+    type: int
+    allowed_min: 1
+    allowed_max: 100
+    unit: symmetric_groups
+    meaning: "official initial map minimum number of four-way symmetric planet groups"
+  map_max_planet_groups:
+    value: 10
+    type: int
+    allowed_min: 1
+    allowed_max: 100
+    unit: symmetric_groups
+    meaning: "official initial map maximum number of four-way symmetric planet groups"
+  map_min_static_groups:
+    value: 3
+    type: int
+    allowed_min: 1
+    allowed_max: 100
+    unit: symmetric_groups
+    meaning: "official initial map minimum number of guaranteed static planet groups"
+  map_planet_clearance:
+    value: 7.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 100.0
+    unit: game_units
+    meaning: "official clearance between generated non-comet planet bodies"
+  map_home_planet_ships:
+    value: 10.0
+    type: float
+    allowed_min: 1.0
+    allowed_max: 1000000.0
+    unit: ships
+    meaning: "official ships assigned to each selected home planet at game start"
+  decoder_aim_search_angle_samples:
+    value: 128
+    type: int
+    allowed_min: 1
+    allowed_max: 360
+    unit: samples_per_side
+    meaning: "post-output decoder geometry search radius in discrete angle samples for selected target hit correction"
+  decoder_aim_search_angle_step_radians:
+    value: 0.01
+    type: float
+    allowed_min: 0.0001
+    allowed_max: 1.0
+    unit: radians
+    meaning: "angle delta per decoder hit-correction search sample"
+  decoder_aim_search_extra_ticks:
+    value: 8
+    type: int
+    allowed_min: 1
+    allowed_max: 1000
+    unit: turns
+    meaning: "extra prediction ticks beyond board-diagonal flight-time horizon for decoder hit correction"
+  default_angular_velocity:
+    value: 0.03
+    type: float
+    allowed_min: -6.28319
+    allowed_max: 6.28319
+    unit: radians_per_turn
+    meaning: "default orbit angle delta used by seeded native simulator games"
+
+submission_limits:
+  max_daily_submissions:
+    value: 5
+    type: int
+    allowed_min: 0
+    allowed_max: 100
+    unit: submissions_per_day
+    meaning: "official daily submission limit"
+  final_submission_count:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 10
+    unit: submissions
+    meaning: "official final submission count"
+  max_team_size:
+    value: 5
+    type: int
+    allowed_min: 1
+    allowed_max: 100
+    unit: people
+    meaning: "official team size limit"
+
+generation_tournament_kaggle_host_submit:
+  enabled:
+    value: true
+    type: bool
+    meaning: "stage the top-1 generation-tournament model by winrate for host-side Kaggle submit after each scheduled generation tournament"
+  competition_slug:
+    value: "orbit-wars"
+    type: string
+    meaning: "Kaggle competition slug used by automatic generation tournament submissions"
+  stage_dir:
+    value: "artifacts/kaggle_auto_submit"
+    type: path
+    meaning: "trainer staging directory for generated Kaggle archives"
+  main_path:
+    value: "kaggle_submission/main.py"
+    type: path
+    meaning: "Python entrypoint copied into the generated Kaggle archive"
+  library_path:
+    value: "target/release/liborbit_wars_ffi.so"
+    type: path
+    meaning: "compiled release FFI library copied into the generated Kaggle archive"
+  archive_name:
+    value: "submission.tar.gz"
+    type: string
+    meaning: "archive filename staged for host-side Kaggle CLI"
+  host_submit_command:
+    value: "kaggle"
+    type: command
+    meaning: "host-side CLI command used by Codex to submit the generated archive"
+
+native_agent:
+  max_rows:
+    value: 64
+    type: int
+    allowed_min: 1
+    allowed_max: 256
+    unit: rows
+    meaning: "fixed transformer input/output row count"
+  initial_planet_slots:
+    value: 40
+    type: int
+    allowed_min: 1
+    allowed_max: 64
+    unit: rows
+    meaning: "slots reserved for initial planets sorted by distance from home"
+  comet_slots:
+    value: 20
+    type: int
+    allowed_min: 0
+    allowed_max: 64
+    unit: rows
+    meaning: "slots reserved for current comet planets"
+  padding_slots:
+    value: 4
+    type: int
+    allowed_min: 0
+    allowed_max: 64
+    unit: rows
+    meaning: "empty row padding slots"
+  ship_log_pivot:
+    value: 1000.0
+    type: float
+    allowed_min: 1.0
+    allowed_max: 1000000.0
+    unit: ships
+    meaning: "ship count mapped to 90 percent of input scale"
+  ship_log_cap:
+    value: 100000.0
+    type: float
+    allowed_min: 2.0
+    allowed_max: 1000000000.0
+    unit: ships
+    meaning: "ship count mapped to 100 percent of input scale"
+  owner_class_player_slots:
+    value: 4
+    type: int
+    allowed_min: 4
+    allowed_max: 4
+    unit: players
+    meaning: "fixed owner-class player slots: current player plus three opponent tokens"
+  owner_class_own:
+    value: 1.0
+    type: float
+    meaning: "owner class scalar for current player's planet"
+  owner_class_enemy_1:
+    value: 0.75
+    type: float
+    meaning: "owner class scalar for first opponent player id in sorted order excluding current player"
+  owner_class_enemy_2:
+    value: 0.5
+    type: float
+    meaning: "owner class scalar for second opponent player id in sorted order excluding current player"
+  owner_class_enemy_3:
+    value: 0.25
+    type: float
+    meaning: "owner class scalar for third opponent player id in sorted order excluding current player"
+  owner_class_neutral:
+    value: 0.0
+    type: float
+    meaning: "owner class scalar for neutral planet"
+  owner_class_empty:
+    value: -0.5
+    type: float
+    meaning: "owner class scalar for empty padded row without planet id"
+  owner_class_absent_on_map:
+    value: -1.0
+    type: float
+    meaning: "owner class scalar for reserved planet row whose planet is absent from current map"
+  intercept_iterations:
+    value: 128
+    type: int
+    allowed_min: 1
+    allowed_max: 256
+    unit: iterations
+    meaning: "fixed-point iterations for moving target intercept angle"
+  max_actions:
+    value: 768
+    type: int
+    allowed_min: 1
+    allowed_max: 1024
+    unit: actions
+    meaning: "C ABI output action buffer capacity; 64 source rows times 12 target slots"
+
+model_timing_1:
+  layers:
+    value: 61
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    meaning: "true2d matrix-layer count around one middle full-attention pass"
+  d_model:
+    value: 32
+    type: int
+    allowed_min: 8
+    allowed_max: 256
+    meaning: "tiny deterministic transformer hidden width"
+  heads:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 16
+    meaning: "tiny deterministic transformer attention heads"
+  seed:
+    value: 17
+    type: int
+    allowed_min: 0
+    allowed_max: 18446744073709551615
+    meaning: "deterministic generated weight seed for timing scaffold"
+
+true2d_model:
+  internal_rows:
+    value: 64
+    type: int
+    allowed_min: 64
+    allowed_max: 64
+    unit: rows
+    meaning: "fixed true 2D transformer relation matrix axis length"
+  input_features:
+    value: 7
+    type: int
+    allowed_min: 7
+    allowed_max: 7
+    unit: features
+    meaning: "strict external input feature count before learned expansion: owner_class, ship_log_percent, x_position_normalized, y_position_normalized, production_normalized, velocity_x_normalized, velocity_y_normalized"
+  internal_shape:
+    value: "64x64"
+    type: string
+    meaning: "learned relation table preserved by each true2d matrix layer and middle attention layer"
+  matrix_layer_planes:
+    value: 12
+    type: int
+    allowed_min: 12
+    allowed_max: 12
+    unit: planes_per_64x64_layer
+    meaning: "trainable per-cell weights per 64x64 matrix layer; 61 layers gives the requested ~3M parameters"
+  target_parameter_count:
+    value: 3000000
+    type: int
+    allowed_min: 3000000
+    allowed_max: 3000000
+    unit: weights
+    meaning: "requested approximate true2d trainable parameter target"
+  actual_parameter_count:
+    value: 3004120
+    type: int
+    allowed_min: 3004120
+    allowed_max: 3004120
+    unit: weights
+    meaning: "current true2d parameter count: expand 4239 + matrix layers 2998272 + attention 13 + output 1596"
+  attention_placement:
+    value: "middle"
+    type: string
+    allowed_values: ["middle"]
+    meaning: "single full relation-cell self-attention layer runs after floor(layers / 2) matrix layers"
+  attention_type:
+    value: "full_qkv_self_attention_over_4096_relation_cells"
+    type: string
+    allowed_values: ["full_qkv_self_attention_over_4096_relation_cells"]
+    meaning: "one middle true2d layer performs Q/K/V self-attention where every relation cell attends to every relation cell"
+  attention_heads:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 16
+    unit: heads
+    meaning: "number of scalar Q/K/V attention heads for full 4096x4096 true2d relation-cell self-attention"
+  attention_score_shape:
+    value: "4096x4096"
+    type: string
+    meaning: "full self-attention score matrix per encoded game state when internal_rows=64"
+  output_features:
+    value: 24
+    type: int
+    allowed_min: 24
+    allowed_max: 24
+    unit: features
+    meaning: "strict external output feature count after learned collapse: 12 target/send pairs per source row"
+  action_targets_per_source:
+    value: 12
+    type: int
+    allowed_min: 12
+    allowed_max: 12
+    unit: target_slots_per_source_row
+    meaning: "each source row emits 12 independent target/send pairs, allowing one planet to launch at up to 12 targets per turn"
+  forbidden_pair_features:
+    value: ["distance", "angle", "flight_time", "sun_intersection", "manual_pair_score", "from_to_heuristic"]
+    type: list[string]
+    meaning: "manual pair features prohibited between encoder and decoder"
+
+training_targets:
+  players_per_game:
+    value: 4
+    type: int
+    allowed_min: 2
+    allowed_max: 4
+    unit: players
+    meaning: "default self-play game mode; current training target is four-player Orbit Wars"
+  population_size:
+    value: 64
+    type: int
+    allowed_min: 4
+    allowed_max: 128
+    unit: models
+    meaning: "self-play evolution population size; reduced from 128 so each model receives more evaluation participations at the same 320-game generation budget"
+  elite_count:
+    value: 6
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: models
+    meaning: "number of selected models used for backprop and reproduction; top-6 keeps the same elite fraction as the old top-12 of 128"
+  generations_per_run:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: generations
+    meaning: "generation count per trainer invocation"
+  demo_generations:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 1000
+    unit: generations
+    meaning: "short CUDA trainer dashboard run length requested for local validation"
+  default_self_play_games:
+    value: 20
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: participations_per_model
+    meaning: "full-mode self-play participations per model before selection; four-player game count is population_size * participations_per_model / players_per_game, currently 64*20/4=320"
+  evaluation_wall_time_target_seconds:
+    value: 10
+    type: int
+    allowed_min: 1
+    allowed_max: 600
+    unit: seconds
+    meaning: "target wall time for one 500-turn population evaluation batch after GPU batching and CPU stepping"
+  generation_wall_time_target_seconds:
+    value: 600
+    type: int
+    allowed_min: 1
+    allowed_max: 3600
+    unit: seconds
+    meaning: "target wall time for one generation including evaluation, elite backprop, replay chunk writing, generation tournament when scheduled, reproduction, and mutation"
+  capture_trajectories:
+    value: true
+    type: bool
+    meaning: "capture every model input 64x7 and raw output 64x24 per active player-state so reward/loss/backprop can attach final game reward and local action penalties to each sample"
+  backprop_enabled:
+    value: true
+    type: bool
+    meaning: "enable full CUDA end-to-end backprop for selected elite models after self-play evaluation and before genetic reproduction"
+  backprop_learning_rate:
+    value: 0.0005
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1.0
+    meaning: "learning rate for full true2d CUDA backprop over elite trajectory samples"
+  backprop_batch_samples:
+    value: 64
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: samples
+    meaning: "CUDA minibatch size for backprop graph memory; all selected trajectory samples are trained, this only chunks GPU work"
+  backprop_send_threshold:
+    value: 0.5
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1.0
+    meaning: "send_fraction threshold used to convert stored action output into the binary send/no-send training target"
+  backprop_reward_normalizer:
+    value: 2.0
+    type: float
+    allowed_min: 0.000001
+    allowed_max: 1000.0
+    meaning: "normalizer for final game reward before multiplying the trajectory loss gradient; current win reward is 2"
+  sun_target_penalty_scale:
+    value: 4.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1000.0
+    meaning: "strong normalized action-local target-choice penalty added only to the source-row/target-slot whose emitted fleet is later destroyed by the sun; value=4 is four normalized reward units and final win/draw/loss rewards remain unchanged"
+  reproduction_min_slots_per_elite:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 64
+    unit: population_slots_per_elite_parent
+    meaning: "minimum next-population slots allocated to every selected elite parent during weighted reproduction; includes the copied elite model itself"
+  reproduction_max_slots_per_elite:
+    value: 18
+    type: int
+    allowed_min: 1
+    allowed_max: 64
+    unit: population_slots_per_elite_parent
+    meaning: "maximum next-population slots allocated to one selected elite parent during weighted reproduction; prevents one noisy winner from dominating the 64-model population"
+  reproduction_winrate_smoothing_wins:
+    value: 1.0
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1000.0
+    unit: virtual_wins
+    meaning: "Laplace-style virtual wins added when computing weighted-reproduction parent winrate"
+  reproduction_winrate_smoothing_games:
+    value: 2.0
+    type: float
+    allowed_min: 0.000001
+    allowed_max: 1000.0
+    unit: virtual_games
+    meaning: "Laplace-style virtual games added when computing weighted-reproduction parent winrate"
+  trajectory_reward_assignment:
+    value: "final_game_reward_per_participant"
+    type: string
+    allowed_values: ["final_game_reward_per_participant"]
+    meaning: "each captured step sample receives the final reward of its game participant after terminal scoring"
+  trajectory_storage_layout:
+    value: "metadata_plus_contiguous_fp32_inputs_outputs"
+    type: string
+    allowed_values: ["metadata_plus_contiguous_fp32_inputs_outputs"]
+    meaning: "host memory layout for generation training data: metadata records plus contiguous fp32 input_rows and output_rows buffers; output rows store 24 floats per source row"
+  checkpoint_path:
+    value: "artifacts/full_training_2026-06-01_self_train_current_contract.checkpoint.bin"
+    type: path
+    meaning: "binary trainer checkpoint path storing run id, next generation, full population weights, and champion archive for resume"
+  checkpoint_format:
+    value: "OWTRAIN1_v1_binary"
+    type: string
+    meaning: "trainer checkpoint format magic/version for checkpoint resume"
+  generation_archive_champions_per_generation:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: models_per_generation
+    meaning: "top models copied from each completed generation into the inter-generation tournament pool"
+  generation_archive_max_generations:
+    value: 32
+    type: int
+    allowed_min: 1
+    allowed_max: 32
+    unit: generations
+    meaning: "maximum generations represented in tournament pool, including current generation"
+  generation_validation_max_models:
+    value: 128
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: models
+    meaning: "maximum archived champion models evaluated during the generation tournament"
+  generation_validation_games_per_model:
+    value: 20
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: participations_per_model
+    meaning: "generation tournament participations per archived champion model; every 32 generations, top 4 models from each retained generation each play 20 participations"
+  generation_validation_interval:
+    value: 32
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: generations
+    meaning: "generation cadence for inter-generation tournament games; current contract runs them only on generation multiples of 32"
+  generation_replay_interval:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: generations
+    meaning: "generation cadence for dashboard replay chunks; current contract stores 4 normal evaluation games every generation without extra replay simulation"
+  default_mutation_sigma:
+    value: 0.02
+    type: float
+    allowed_min: 0.0
+    allowed_max: 10.0
+    meaning: "deterministic mutation amplitude for genetic reproduction"
+  cpu_workers:
+    value: 12
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: workers
+    meaning: "user-approved CPU workers for trainer host-side self-play phases: request collection, CUDA output decode, and non-live state application"
+  target_gpu_batch_games:
+    value: 65536
+    type: int
+    allowed_min: 1
+    allowed_max: 1048576
+    unit: games
+    meaning: "target simultaneous GPU inference game batch after VRAM proof"
+
+trainer_smoke:
+  population_size:
+    value: 8
+    type: int
+    allowed_min: 1
+    allowed_max: 4096
+    unit: models
+    meaning: "small local trainer population for smoke verification"
+  elite_count:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: models
+    meaning: "small local trainer selected model count for smoke verification"
+  games_per_model:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: participations_per_model
+    meaning: "smoke self-play participations per model before selection"
+  episode_steps:
+    value: 64
+    type: int
+    allowed_min: 1
+    allowed_max: 10000
+    unit: turns
+    meaning: "smoke self-play maximum game length"
+
+dashboard_strict_training:
+  population_size:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 4096
+    unit: models
+    meaning: "small strict 500-turn trainer population for dashboard verification"
+  elite_count:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 128
+    unit: models
+    meaning: "selected model count for strict dashboard verification"
+  games_per_model:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 1000000
+    unit: participations_per_model
+    meaning: "strict 500-turn self-play participations per model before selection"
+  replays_per_model:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 1000
+    unit: games_per_model
+    meaning: "strict 500-turn sampled replay games stored per model per generation"
+  episode_steps:
+    value: 500
+    type: int
+    allowed_min: 500
+    allowed_max: 500
+    unit: turns
+    meaning: "strict dashboard profile uses official maximum game length"
+  expected_frames_per_game:
+    value: 501
+    type: int
+    allowed_min: 501
+    allowed_max: 501
+    unit: frames_per_game
+    meaning: "full replay frame count for step 0 plus 500 turns"
+
+training_rewards:
+  win:
+    value: 2
+    type: int
+    allowed_min: -1000
+    allowed_max: 1000
+    meaning: "reward assigned to self-play win"
+  draw:
+    value: -1
+    type: int
+    allowed_min: -1000
+    allowed_max: 1000
+    meaning: "negative reward assigned to self-play draw; softer penalty than loss"
+  loss:
+    value: -2
+    type: int
+    allowed_min: -1000
+    allowed_max: 1000
+    meaning: "reward assigned to self-play loss"
+
+dashboard_replays:
+  replays_per_model:
+    value: 10
+    type: int
+    allowed_min: 1
+    allowed_max: 1000
+    unit: games_per_model
+    meaning: "legacy per-model replay target retained for dashboard-strict compatibility; normal full training stores generation_replay_game_count actual games"
+  generation_replay_game_count:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 320
+    unit: actual_games_per_generation
+    meaning: "number of real evaluation games archived in the replay chunk for every generation"
+  frame_stride:
+    value: 8
+    type: int
+    allowed_min: 1
+    allowed_max: 500
+    unit: turns
+    meaning: "turn interval between stored replay frames"
+  full_replay_frame_stride:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 500
+    unit: turns
+    meaning: "turn interval used when trainer runs with --full-replays"
+  max_frames:
+    value: 64
+    type: int
+    allowed_min: 1
+    allowed_max: 10000
+    unit: frames_per_game
+    meaning: "maximum stored replay frames per sampled game"
+  live_replay_enabled:
+    value: true
+    type: bool
+    meaning: "write a small live replay sample into dashboard latest telemetry during evaluation"
+  live_replay_game_count:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 320
+    unit: simultaneous_games
+    meaning: "number of active actual games mirrored into binary live replay while evaluation is still running"
+  live_replay_frame_stride:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 500
+    unit: turns
+    meaning: "turn interval for live replay frames; value 1 means dashboard can show every turn"
+  live_replay_update_interval_turns:
+    value: 1
+    type: int
+    allowed_min: 1
+    allowed_max: 500
+    unit: turns
+    meaning: "how often the trainer rewrites latest telemetry with live replay progress"
+  live_replay_slot_bytes:
+    value: 131072
+    type: int
+    allowed_min: 4096
+    allowed_max: 1048576
+    unit: bytes
+    meaning: "fixed payload capacity per live replay frame slot in preallocated .owslot storage; oversized frames fail visibly instead of falling back to JSON"
+
+cuda_training:
+  trainable_forward_abi:
+    value: "orbit_wars_cuda_trainable_forward"
+    type: string
+    meaning: "C ABI entrypoint for host-buffer batched TrainableTransformer forward inference"
+  true2d_forward_abi:
+    value: "orbit_wars_cuda_true2d_forward"
+    type: string
+    meaning: "C ABI entrypoint for host-buffer batched True2DTransformer forward inference"
+  true2d_forward_many_abi:
+    value: "orbit_wars_cuda_true2d_forward_many"
+    type: string
+    meaning: "C ABI entrypoint for one CUDA batch containing many True2DTransformer models selected by model_id per input"
+  true2d_upload_population_abi:
+    value: "orbit_wars_cuda_true2d_upload_population"
+    type: string
+    meaning: "C ABI entrypoint that uploads all True2DTransformer population weights to persistent VRAM workspace once per population/archive"
+  true2d_forward_many_resident_abi:
+    value: "orbit_wars_cuda_true2d_forward_many_resident"
+    type: string
+    meaning: "C ABI entrypoint for many-model True2DTransformer forward inference using resident GPU population weights"
+  true2d_batch_model_selector:
+    value: "model_indices_per_input"
+    type: string
+    allowed_values: ["model_indices_per_input"]
+    meaning: "CUDA batching contract: every packed input row group carries one model index selecting weights inside kernels"
+  true2d_static_workspace_mode:
+    value: "persistent_device_buffers_and_resident_population_resize_on_capacity_or_shape_change"
+    type: string
+    allowed_values: ["persistent_device_buffers_and_resident_population_resize_on_capacity_or_shape_change"]
+    meaning: "CUDA true2d many-forward workspace contract; device buffers and uploaded population weights persist across turn forwards and reallocate only when capacity or shape changes"
+  true2d_max_requests_per_forward:
+    value: 8192
+    type: int
+    allowed_min: 1
+    allowed_max: 65536
+    unit: requests
+    meaning: "maximum player-state requests per CUDA true2d many-forward call; full training may split a turn into explicit ordered chunks while preserving model_indices per request"
+  true2d_cuda_library_path_env:
+    value: "ORBIT_WARS_CUDA_LIB_PATH"
+    type: env_var
+    meaning: "optional explicit path to compiled CUDA shared library for Rust trainer"
+  true2d_cuda_library_default_path:
+    value: "target/liborbit_wars_cuda.so"
+    type: path
+    meaning: "default CUDA shared library path used by Rust trainer when env var is absent"
+  true2d_precision_policy:
+    value: "fp32_final_weights_bf16_cuda_inference_operands_fp32_accumulation"
+    type: string
+    meaning: "precision policy; CPU submission and stored model weights remain fp32 while CUDA inference attention uses bf16-rounded operands with fp32 accumulation"
+  cuda_true2d_smoke_games:
+    value: 2
+    type: int
+    allowed_min: 1
+    allowed_max: 1024
+    unit: games
+    meaning: "number of encoded states used by Rust CUDA true2d smoke comparison"
+  cuda_true2d_forward_tolerance:
+    value: 0.0005
+    type: float
+    allowed_min: 0.0
+    allowed_max: 1.0
+    meaning: "maximum allowed absolute difference between CPU and CUDA true2d smoke outputs"
+  trainable_forward_input_features:
+    value: 2
+    type: int
+    allowed_min: 2
+    allowed_max: 2
+    unit: features
+    meaning: "strict input feature count for CUDA trainable transformer forward"
+  trainable_forward_output_features:
+    value: 2
+    type: int
+    allowed_min: 2
+    allowed_max: 2
+    unit: features
+    meaning: "strict output feature count for legacy CUDA trainable transformer forward"
+  runtime_smoke_games:
+    value: 4
+    type: int
+    allowed_min: 1
+    allowed_max: 1048576
+    unit: games
+    meaning: "small CUDA trainable forward runtime smoke batch size"
+
+dashboard:
+  dev_server_port:
+    value: 5173
+    type: int
+    allowed_min: 1
+    allowed_max: 65535
+    unit: tcp_port
+    meaning: "preferred Vite dev server port"
+  telemetry_path:
+    value: "dashboard/public/telemetry/latest.json"
+    type: path
+    meaning: "non-blocking dashboard telemetry artifact path"
+  telemetry_replay_chunk_pattern:
+    value: "dashboard/public/telemetry/replays_{run_id}_generation_{generation}.json"
+    type: path_template
+    meaning: "per-run per-generation replay index manifest path used to keep latest telemetry small and expose game list without loading frames"
+  telemetry_replay_game_pattern:
+    value: "dashboard/public/telemetry/replay_games/{run_id}/generation_{generation}_game_{game_index}.json"
+    type: path_template
+    meaning: "per-run per-generation per-game replay payload path; dashboard loads only the selected game payload"
+  telemetry_replay_chunk_format:
+    value: "indexed_replay_v1"
+    type: string
+    meaning: "indexed replay manifest format consumed by dashboard loader; each game entry points to one compact_replay_game_v1 payload"
+  telemetry_model_metrics:
+    value: ["games", "wins", "draws", "losses", "captures", "fleetHits", "hitShips", "sunDestroyedFleets", "sunDestroyedShips", "outOfBoundsFleets", "outOfBoundsShips", "launchActions", "launchedShips", "avgFleetSize"]
+    type: list[string]
+    meaning: "per-model gameplay metrics emitted by trainer and displayed in dashboard model table"
+  telemetry_poll_interval_ms:
+    value: 2000
+    type: int
+    allowed_min: 100
+    allowed_max: 60000
+    unit: milliseconds
+    meaning: "dashboard polling interval for latest trainer telemetry"
+  replay_play_interval_ms:
+    value: 120
+    type: int
+    allowed_min: 16
+    allowed_max: 5000
+    unit: milliseconds
+    meaning: "dashboard replay autoplay frame advance interval"

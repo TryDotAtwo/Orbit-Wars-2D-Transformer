@@ -1,0 +1,20 @@
+timestamp=2026-05-31T18:00:00+03:00
+task_id=2026-05-31_replay_canvas_and_targeting_question
+agent_id=codex
+source=user
+related_files=[
+  "crates/orbit-wars-core/src/geometry.rs",
+  "crates/orbit-wars-core/src/decoder.rs",
+  "dashboard/src/App.tsx",
+  "dashboard/src/ReplayCanvas.tsx",
+  "dashboard/src/styles.css",
+  "dashboard/public/telemetry/latest.json",
+  "dashboard/public/telemetry/replays_1780239301_generation_1.json",
+  "dashboard/public/telemetry/replays_1780239301_generation_2.json",
+  "dashboard/public/telemetry/replays_1780239301_generation_3.json",
+  "dashboard/public/telemetry/replays_1780239301_generation_4.json",
+  "test_results/2026-05-31_replay_canvas_and_targeting_question.md"
+]
+intended_action=fix_replay_canvas_fit_and_verify_or_fix_fleet_targeting
+result_status=completed
+prompt_raw=Реплей канвас не помещается в экране. Также кораблики в цель не летят чтоль?

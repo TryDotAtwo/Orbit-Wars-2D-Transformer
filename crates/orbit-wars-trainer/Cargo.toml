@@ -1,0 +1,13 @@
+[package]
+name = "orbit-wars-trainer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "orbit-wars-trainer"
+path = "src/main.rs"
+
+[dependencies]
+orbit-wars-core = { path = "../orbit-wars-core" }
+

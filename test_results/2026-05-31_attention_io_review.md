@@ -1,0 +1,11 @@
+timestamp=2026-05-31T03:20:00+03:00
+task_id=2026-05-31_attention_io_review
+branch=unknown_unborn_git_head
+commit=unknown_unborn_git_head
+environment=local_powershell_workspace
+command=source_inspection_only
+result=not_run
+artifacts=[]
+logs=[]
+inspected_files=[crates/orbit-wars-core/src/model.rs,crates/orbit-wars-core/src/encoder.rs,crates/orbit-wars-core/src/decoder.rs,crates/orbit-wars-core/src/types.rs,crates/orbit-wars-core/src/config.rs,native/cuda/orbit_wars_cuda.cu]
+conclusion=TrainableTransformer input is 64 rows x 2 features; row self-attention uses source-row by target-row score matrix per head; output is 64 rows x 2 action fractions; no executable tests were run because the user requested source inspection.
