@@ -189,3 +189,37 @@ git push -u origin codex/perf-memory-first-pass
 ```
 
 Expected: branch is visible on GitHub.
+
+### Task 6: CUDA Forward Packing Scratch
+
+**Files:**
+- Modify: `crates/orbit-wars-trainer/src/main.rs`
+- Register: `test_results/2026-06-03_population_forward_scratch.md`
+
+- [x] **Step 1: Add a failing scratch test**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo test -p orbit-wars-trainer population_forward_scratch -- --nocapture"
+```
+
+Expected: RED before implementation because `PopulationForwardScratch` does not exist.
+
+- [x] **Step 2: Add reusable scratch**
+
+Implemented `PopulationForwardScratch` with reusable `input_rows` and `model_indices` buffers plus visible overflow handling for capacity calculation.
+
+- [x] **Step 3: Use scratch in trainer loop**
+
+Created scratch once in `run_games_batched` and passed it through `resolve_action_requests` to `batched_population_outputs`.
+
+- [x] **Step 4: Verify**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo fmt --all && cargo test --workspace"
+```
+
+Expected: all Rust tests pass.

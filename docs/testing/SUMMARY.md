@@ -1,8 +1,8 @@
 # docs/testing/SUMMARY.md
 
-timestamp=2026-06-03T17:33:00+03:00
+timestamp=2026-06-03T17:43:00+03:00
 section=testing
-active_task_id=2026-06-03_hot_loop_allocation_cleanup
+active_task_id=2026-06-03_population_forward_scratch
 
 ## Purpose
 
@@ -34,6 +34,7 @@ npm.cmd run build
 
 ## Latest Records
 
+- `test_results/2026-06-03_population_forward_scratch.md`: red/green scratch test plus full `cargo fmt --all && cargo test --workspace`; core 35 passed, trainer 24 passed.
 - `test_results/2026-06-03_hot_loop_allocation_cleanup.md`: red/green sample-index test plus full `cargo fmt --all && cargo test --workspace`; core 35 passed, trainer 23 passed.
 - `test_results/2026-06-03_checkpoint_path_config_fix.md`: checkpoint save path helper covered with red/green targeted trainer tests; `cargo fmt --all` passed.
 - `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md`: dashboard production build passes after disabling public-dir copy; `dist/telemetry` is absent and `dist` payload is about 246 KB.

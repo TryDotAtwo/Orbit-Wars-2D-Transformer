@@ -307,6 +307,35 @@ struct ActionRequest {
     rows: Vec<RowFeature>,
 }
 
+#[derive(Debug, Default)]
+struct PopulationForwardScratch {
+    input_rows: Vec<f32>,
+    model_indices: Vec<usize>,
+}
+
+impl PopulationForwardScratch {
+    fn pack_chunk(
+        &mut self,
+        request_chunk: &[ActionRequest],
+        config: &AgentConfig,
+    ) -> Result<(), String> {
+        self.input_rows.clear();
+        self.model_indices.clear();
+        let input_capacity = request_chunk
+            .len()
+            .checked_mul(config.max_rows)
+            .and_then(|value| value.checked_mul(config.true2d_input_features))
+            .ok_or_else(|| "population_forward_scratch_input_capacity_overflow".to_string())?;
+        self.input_rows.reserve(input_capacity);
+        self.model_indices.reserve(request_chunk.len());
+        for request in request_chunk {
+            cuda_true2d::pack_rows_into(&request.rows, config, &mut self.input_rows)?;
+            self.model_indices.push(request.model_index);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ActionTrace {
     sample_index: usize,
@@ -3100,6 +3129,7 @@ fn run_games_batched(
         ..PipelineStats::default()
     };
     let mut requests_per_game = vec![0usize; active_games.len()];
+    let mut population_forward_scratch = PopulationForwardScratch::default();
     let mut live_telemetry_warning_emitted = false;
     let mut live_storage_warning_emitted = false;
     let mut live_replay_storage = if let Some(telemetry) = live_replay_telemetry {
@@ -3178,6 +3208,7 @@ fn run_games_batched(
             config,
             cuda_backend,
             &mut pipeline_stats,
+            &mut population_forward_scratch,
             if capture_training_samples {
                 Some(&mut training_samples)
             } else {
@@ -3635,6 +3666,7 @@ fn resolve_action_requests(
     config: &AgentConfig,
     cuda_backend: Option<&cuda_true2d::CudaTrue2D>,
     pipeline_stats: &mut PipelineStats,
+    population_forward_scratch: &mut PopulationForwardScratch,
     mut training_samples: Option<&mut TrainingSamples>,
     generation: usize,
     active_player_count: usize,
@@ -3660,8 +3692,14 @@ fn resolve_action_requests(
         })
         .collect::<Vec<_>>();
     if let Some(cuda) = cuda_backend {
-        let outputs =
-            batched_population_outputs(population, action_requests, config, cuda, pipeline_stats)?;
+        let outputs = batched_population_outputs(
+            population,
+            action_requests,
+            config,
+            cuda,
+            pipeline_stats,
+            population_forward_scratch,
+        )?;
         let mut first_sample_index = None;
         if let Some(samples) = training_samples.as_deref_mut() {
             let sample_start = samples.sample_count();
@@ -3948,6 +3986,7 @@ fn batched_population_outputs(
     config: &AgentConfig,
     cuda: &cuda_true2d::CudaTrue2D,
     pipeline_stats: &mut PipelineStats,
+    scratch: &mut PopulationForwardScratch,
 ) -> Result<Vec<ActionOutput>, String> {
     if action_requests.is_empty() {
         return Ok(Vec::new());
@@ -3959,17 +3998,10 @@ fn batched_population_outputs(
     let mut outputs = Vec::with_capacity(action_requests.len() * config.max_rows);
     for request_chunk in action_requests.chunks(request_chunk_size) {
         pipeline_stats.record_batch(request_chunk.len());
-        let mut input_rows = Vec::with_capacity(
-            request_chunk.len() * config.max_rows * config.true2d_input_features,
-        );
-        let mut model_indices = Vec::with_capacity(request_chunk.len());
-        for request in request_chunk {
-            cuda_true2d::pack_rows_into(&request.rows, config, &mut input_rows)?;
-            model_indices.push(request.model_index);
-        }
+        scratch.pack_chunk(request_chunk, config)?;
         outputs.extend(cuda.forward_population_resident_packed(
-            &input_rows,
-            &model_indices,
+            &scratch.input_rows,
+            &scratch.model_indices,
             population,
             config,
         )?);
@@ -6335,6 +6367,45 @@ mod tests {
             Some(FIRST_RECORDED_SAMPLE + THIRD_REQUEST_INDEX)
         );
         assert_eq!(decode_sample_index(None, THIRD_REQUEST_INDEX), None);
+    }
+
+    #[test]
+    fn population_forward_scratch_reuses_packed_input_capacity() {
+        let config = AgentConfig::default();
+        let first_request = ActionRequest {
+            game_index: 0,
+            player_slot: 0,
+            player_id: PLAYER_ZERO,
+            model_index: 3,
+            step: 0,
+            planets: Vec::new(),
+            initial_planets: Vec::new(),
+            angular_velocity: 0.0,
+            rows: vec![RowFeature::empty(&config); config.max_rows],
+        };
+        let second_request = ActionRequest {
+            model_index: 5,
+            ..first_request.clone()
+        };
+        let mut scratch = PopulationForwardScratch::default();
+
+        scratch
+            .pack_chunk(&[first_request.clone(), second_request], &config)
+            .unwrap();
+        let first_capacity = scratch.input_rows.capacity();
+        assert_eq!(
+            scratch.input_rows.len(),
+            2 * config.max_rows * config.true2d_input_features
+        );
+        assert_eq!(scratch.model_indices, vec![3, 5]);
+
+        scratch.pack_chunk(&[first_request], &config).unwrap();
+        assert!(scratch.input_rows.capacity() >= first_capacity);
+        assert_eq!(
+            scratch.input_rows.len(),
+            config.max_rows * config.true2d_input_features
+        );
+        assert_eq!(scratch.model_indices, vec![3]);
     }
 
     #[test]
