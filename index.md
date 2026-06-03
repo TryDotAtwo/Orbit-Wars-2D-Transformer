@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T17:50:52+03:00
+timestamp=2026-06-03T18:01:08+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_live_completed_replay_storage_split
+active_task_id=2026-06-03_replay_frame_sharing
 
 ## How To Use This Index
 
@@ -134,6 +134,7 @@ active_task_id=2026-06-03_live_completed_replay_storage_split
 | `test_results/2026-06-03_hot_loop_allocation_cleanup.md` | Red/green and full Rust verification for small trainer hot-loop allocation cleanup. |
 | `test_results/2026-06-03_population_forward_scratch.md` | Red/green and full Rust verification for reusable CUDA forward host packing scratch. |
 | `test_results/2026-06-03_live_completed_replay_storage_split.md` | Rust/dashboard/browser verification for append-only live replay storage and lazy completed replay loading. |
+| `test_results/2026-06-03_replay_frame_sharing.md` | Rust verification for sharing completed replay frame buffers across participant views. |
 
 ## Search Hints
 

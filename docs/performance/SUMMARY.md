@@ -1,8 +1,8 @@
 # docs/performance/SUMMARY.md
 
-timestamp=2026-06-03T17:50:52+03:00
+timestamp=2026-06-03T18:01:08+03:00
 section=performance
-active_task_id=2026-06-03_live_completed_replay_storage_split
+active_task_id=2026-06-03_replay_frame_sharing
 
 ## Current Facts
 
@@ -13,11 +13,13 @@ active_task_id=2026-06-03_live_completed_replay_storage_split
 - Live and completed replay storage were changed to avoid giant repeated JSON polling.
 - Dashboard replay chunks are loaded lazily; non-Replay tabs should fetch lightweight telemetry only.
 - Live replay storage now writes append-only `.owlive` records instead of preallocating `.owslot` frame slots; dashboard polling uses `latest.json` frames and does not bulk-load the growing live file.
+- Completed replay participant views now share one immutable `Arc<Vec<ReplayFrame>>` per actual game instead of cloning identical frame vectors per player view.
 - Current 64-model/20-participation generations are measured but slow: generation 58 took about 1249 s, generation 59 about 1288 s, generation 60 about 1398 s.
 - Dashboard production build no longer copies runtime telemetry into `dist`; `npm.cmd run build` produced a 245,917 byte payload after `build.copyPublicDir=false`.
 - Trainer hot-loop cleanup removed one per-turn `requests_per_game` allocation and per-turn/per-model sample-index vector allocation; behavior is covered by `test_results/2026-06-03_hot_loop_allocation_cleanup.md`.
 - CUDA resident population forward packing now reuses host `input_rows` and `model_indices` scratch buffers across turns/chunks; behavior is covered by `test_results/2026-06-03_population_forward_scratch.md`.
 - Live/completed replay storage split is covered by `test_results/2026-06-03_live_completed_replay_storage_split.md`.
+- Completed replay frame sharing is covered by `test_results/2026-06-03_replay_frame_sharing.md`.
 
 ## Active Bottlenecks
 

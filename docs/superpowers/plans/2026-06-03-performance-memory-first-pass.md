@@ -251,3 +251,33 @@ npm.cmd run build
 ```
 
 Expected: Rust workspace and dashboard production build pass.
+
+### Task 8: Share Completed Replay Frames
+
+**Files:**
+- Modify: `crates/orbit-wars-trainer/src/main.rs`
+- Register: `test_results/2026-06-03_replay_frame_sharing.md`
+
+- [x] **Step 1: Add a failing sharing test**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo test -p orbit-wars-trainer replay_games_share_frames_for_same_actual_game -- --nocapture"
+```
+
+Result: RED before implementation because replay frame buffers were not shared.
+
+- [x] **Step 2: Share immutable frame buffers**
+
+Changed `ReplayGame.frames` to `Arc<Vec<ReplayFrame>>` and made `replay_games_from_evaluation` share one frame vector across all participant views of the same actual game.
+
+- [x] **Step 3: Verify**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo fmt --all && cargo test --workspace"
+```
+
+Result: full Rust workspace passed.

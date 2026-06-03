@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -381,7 +382,7 @@ struct ReplayGame {
     opponent_label: String,
     game_index: usize,
     reward: i32,
-    frames: Vec<ReplayFrame>,
+    frames: Arc<Vec<ReplayFrame>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1902,6 +1903,7 @@ fn replay_games_from_evaluation(
         .take(captured_game_count)
         .enumerate()
     {
+        let shared_frames = Arc::new(game_result.frames.clone());
         for player_slot in 0..active_player_count {
             let model_index = assignment.model_indices[player_slot];
             replay_games.push(ReplayGame {
@@ -1914,7 +1916,7 @@ fn replay_games_from_evaluation(
                 ),
                 game_index: source_game_index,
                 reward: game_result.rewards[player_slot],
-                frames: game_result.frames.clone(),
+                frames: Arc::clone(&shared_frames),
             });
         }
     }
@@ -5335,7 +5337,7 @@ fn compact_live_slot_to_owlive_from_replay_games(
         let first = participants
             .first()
             .ok_or_else(|| "live_replay_compact_empty_game".to_string())?;
-        for frame in &first.frames {
+        for frame in first.frames.iter() {
             bytes.push(LIVE_REPLAY_RECORD_FRAME);
             push_usize_as_u32(
                 &mut bytes,
@@ -5585,7 +5587,7 @@ fn compact_replay_actual_game_json(first: &ReplayGame, participants: &[&ReplayGa
             .map(|game| compact_replay_participant_json(game))
             .collect::<Vec<_>>()
             .join(","),
-        compact_replay_frames_json(&first.frames)
+        compact_replay_frames_json(first.frames.as_ref())
     )
 }
 
@@ -6016,6 +6018,41 @@ mod tests {
         assert!(game_view_counts
             .values()
             .all(|count| *count == PLAYER_COUNT_FOUR));
+    }
+
+    #[test]
+    fn replay_games_share_frames_for_same_actual_game() {
+        let config = AgentConfig::default();
+        let assignments = game_assignments(
+            config.trainer_smoke_population_size,
+            config.trainer_smoke_games_per_model,
+            PLAYER_COUNT_FOUR,
+            &config,
+        )
+        .unwrap();
+        let state = seeded_state(&config, PLAYER_COUNT_FOUR, FIRST_GENERATION, 0).unwrap();
+        let frame = replay_frame_from_state(&state);
+        let games = assignments
+            .iter()
+            .map(|_| GameRunResult {
+                rewards: [config.training_reward_win; MAX_PLAYER_SLOTS],
+                frames: vec![frame.clone()],
+                stats: ComputeStats::default(),
+                gameplay: [GameplayStats::default(); MAX_PLAYER_SLOTS],
+            })
+            .collect::<Vec<_>>();
+        let replay_games = replay_games_from_evaluation(
+            FIRST_GENERATION,
+            &assignments,
+            &games,
+            PLAYER_COUNT_FOUR,
+            1,
+        );
+
+        assert_eq!(replay_games.len(), PLAYER_COUNT_FOUR);
+        for replay_game in replay_games.iter().skip(1) {
+            assert!(Arc::ptr_eq(&replay_games[0].frames, &replay_game.frames));
+        }
     }
 
     #[test]

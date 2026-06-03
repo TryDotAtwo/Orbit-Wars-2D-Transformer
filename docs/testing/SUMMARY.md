@@ -1,8 +1,8 @@
 # docs/testing/SUMMARY.md
 
-timestamp=2026-06-03T17:50:52+03:00
+timestamp=2026-06-03T18:01:08+03:00
 section=testing
-active_task_id=2026-06-03_live_completed_replay_storage_split
+active_task_id=2026-06-03_replay_frame_sharing
 
 ## Purpose
 
@@ -34,6 +34,7 @@ npm.cmd run build
 
 ## Latest Records
 
+- `test_results/2026-06-03_replay_frame_sharing.md`: completed replay participant views share frame buffers; targeted Rust test and full Rust workspace passed.
 - `test_results/2026-06-03_live_completed_replay_storage_split.md`: append-only `.owlive` live storage, no dashboard bulk live replay polling; targeted Rust test, full Rust workspace, dashboard build, and Browser smoke passed.
 - `test_results/2026-06-03_population_forward_scratch.md`: red/green scratch test plus full `cargo fmt --all && cargo test --workspace`; core 35 passed, trainer 24 passed.
 - `test_results/2026-06-03_hot_loop_allocation_cleanup.md`: red/green sample-index test plus full `cargo fmt --all && cargo test --workspace`; core 35 passed, trainer 23 passed.
