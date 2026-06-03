@@ -3099,6 +3099,7 @@ fn run_games_batched(
         simultaneous_game_count: active_games.len(),
         ..PipelineStats::default()
     };
+    let mut requests_per_game = vec![0usize; active_games.len()];
     let mut live_telemetry_warning_emitted = false;
     let mut live_storage_warning_emitted = false;
     let mut live_replay_storage = if let Some(telemetry) = live_replay_telemetry {
@@ -3192,7 +3193,7 @@ fn run_games_batched(
             .count()
             .max(1) as f32;
         let action_elapsed_ms_per_game = action_elapsed_ms / active_game_count;
-        let mut requests_per_game = vec![0usize; active_games.len()];
+        requests_per_game.fill(0);
         for request in &action_requests {
             requests_per_game[request.game_index] += 1;
         }
@@ -3661,9 +3662,9 @@ fn resolve_action_requests(
     if let Some(cuda) = cuda_backend {
         let outputs =
             batched_population_outputs(population, action_requests, config, cuda, pipeline_stats)?;
-        let mut sample_indices = None;
+        let mut first_sample_index = None;
         if let Some(samples) = training_samples.as_deref_mut() {
-            let first_sample_index = samples.sample_count();
+            let sample_start = samples.sample_count();
             record_training_samples(
                 samples,
                 generation,
@@ -3671,17 +3672,14 @@ fn resolve_action_requests(
                 &outputs,
                 config,
             )?;
-            sample_indices = Some(
-                (first_sample_index..first_sample_index + action_requests.len())
-                    .collect::<Vec<_>>(),
-            );
+            first_sample_index = Some(sample_start);
         }
         decode_outputs_into_actions(
             action_requests,
             &outputs,
             config,
             active_player_count,
-            sample_indices.as_deref(),
+            first_sample_index,
             &mut actions_by_game,
             &mut traces_by_game,
         )?;
@@ -3702,9 +3700,9 @@ fn resolve_action_requests(
     for (model_index, requests) in requests_by_model {
         let outputs =
             batched_model_outputs(&population[model_index], &requests, config, pipeline_stats)?;
-        let mut sample_indices = None;
+        let mut first_sample_index = None;
         if let Some(samples) = training_samples.as_deref_mut() {
-            let first_sample_index = samples.sample_count();
+            let sample_start = samples.sample_count();
             record_training_samples(
                 samples,
                 generation,
@@ -3712,8 +3710,7 @@ fn resolve_action_requests(
                 &outputs,
                 config,
             )?;
-            sample_indices =
-                Some((first_sample_index..first_sample_index + requests.len()).collect::<Vec<_>>());
+            first_sample_index = Some(sample_start);
         }
         let request_clones = requests
             .iter()
@@ -3724,7 +3721,7 @@ fn resolve_action_requests(
             &outputs,
             config,
             active_player_count,
-            sample_indices.as_deref(),
+            first_sample_index,
             &mut actions_by_game,
             &mut traces_by_game,
         )?;
@@ -3765,7 +3762,7 @@ fn decode_outputs_into_actions(
     outputs: &[ActionOutput],
     config: &AgentConfig,
     active_player_count: usize,
-    sample_indices: Option<&[usize]>,
+    first_sample_index: Option<usize>,
     actions_by_game: &mut [Vec<Vec<MoveCommand>>],
     traces_by_game: &mut [Vec<Vec<ActionTrace>>],
 ) -> Result<(), String> {
@@ -3778,11 +3775,6 @@ fn decode_outputs_into_actions(
     }
     if action_requests.is_empty() {
         return Ok(());
-    }
-    if let Some(indices) = sample_indices {
-        if indices.len() != action_requests.len() {
-            return Err("decode_sample_index_count_mismatch".to_string());
-        }
     }
     let worker_count = worker_count_for_len(action_requests.len());
     let chunk_size = chunk_size_for_workers(action_requests.len(), worker_count);
@@ -3810,7 +3802,7 @@ fn decode_outputs_into_actions(
                         config,
                     )
                     .map_err(|error| format!("decode_failed={error:?}"))?;
-                    let sample_index = sample_indices.map(|indices| indices[request_index]);
+                    let sample_index = decode_sample_index(first_sample_index, request_index);
                     let (game_actions, action_traces) =
                         action_trace_records(decoded_commands, sample_index);
                     decoded.push((
@@ -3845,6 +3837,10 @@ fn decode_outputs_into_actions(
         player_traces[player_slot] = action_traces;
     }
     Ok(())
+}
+
+fn decode_sample_index(first_sample_index: Option<usize>, request_index: usize) -> Option<usize> {
+    first_sample_index.map(|first_index| first_index + request_index)
 }
 
 fn action_trace_records(
@@ -6327,6 +6323,18 @@ mod tests {
         );
         assert_eq!(samples.output_rows[0], 0.25);
         assert_eq!(samples.output_rows[1], 0.75);
+    }
+
+    #[test]
+    fn decode_sample_index_offsets_from_first_recorded_sample() {
+        const FIRST_RECORDED_SAMPLE: usize = 10;
+        const THIRD_REQUEST_INDEX: usize = 2;
+
+        assert_eq!(
+            decode_sample_index(Some(FIRST_RECORDED_SAMPLE), THIRD_REQUEST_INDEX),
+            Some(FIRST_RECORDED_SAMPLE + THIRD_REQUEST_INDEX)
+        );
+        assert_eq!(decode_sample_index(None, THIRD_REQUEST_INDEX), None);
     }
 
     #[test]

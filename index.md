@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T17:22:00+03:00
+timestamp=2026-06-03T17:33:00+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_checkpoint_path_config_fix
+active_task_id=2026-06-03_hot_loop_allocation_cleanup
 
 ## How To Use This Index
 
@@ -129,6 +129,7 @@ active_task_id=2026-06-03_checkpoint_path_config_fix
 | `docs/superpowers/plans/2026-06-03-performance-memory-first-pass.md` | Superpowers implementation plan for the first performance/memory pass. |
 | `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md` | Dashboard production build verification after preventing runtime telemetry copy into `dist`. |
 | `test_results/2026-06-03_checkpoint_path_config_fix.md` | Red/green verification for config/resume-aware trainer checkpoint save path. |
+| `test_results/2026-06-03_hot_loop_allocation_cleanup.md` | Red/green and full Rust verification for small trainer hot-loop allocation cleanup. |
 
 ## Search Hints
 

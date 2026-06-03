@@ -16,7 +16,7 @@
 - Stage: all non-ignored project files.
 - Commit: baseline snapshot before performance work.
 
-- [ ] **Step 1: Verify ignored heavy artifacts are not staged**
+- [x] **Step 1: Verify ignored heavy artifacts are not staged**
 
 Run:
 
@@ -27,7 +27,7 @@ git add -n -A -- .
 
 Expected: ignored `artifacts/`, `target/`, `dashboard/node_modules/`, and `dashboard/public/telemetry/`; dry-run does not list those ignored paths.
 
-- [ ] **Step 2: Create working branch**
+- [x] **Step 2: Create working branch**
 
 Run:
 
@@ -37,7 +37,7 @@ git switch -c codex/perf-memory-first-pass
 
 Expected: branch created.
 
-- [ ] **Step 3: Commit baseline**
+- [x] **Step 3: Commit baseline**
 
 Run:
 
@@ -55,15 +55,15 @@ Expected: first local commit contains only non-ignored project files.
 - Register: `test_results/2026-06-03_dashboard_build_telemetry_copy_fix.md`
 - Register: `docs/testing/SUMMARY.md`, `docs/performance/SUMMARY.md`, `index.md`
 
-- [ ] **Step 1: Confirm current failure**
+- [x] **Step 1: Confirm current failure**
 
 Use the existing red evidence from `test_results/2026-06-03_nvidia_perf_bug_review_no_code_changes.md`: `npm.cmd run build` fails with `ENOSPC` while copying `dashboard/public/telemetry` to `dashboard/dist`.
 
-- [ ] **Step 2: Change Vite build-only copy behavior**
+- [x] **Step 2: Change Vite build-only copy behavior**
 
 Set `build.copyPublicDir=false` in `dashboard/vite.config.ts`. Dev server still serves `dashboard/public`; production build no longer copies runtime telemetry into `dist`.
 
-- [ ] **Step 3: Verify dashboard build**
+- [x] **Step 3: Verify dashboard build**
 
 Run:
 
@@ -74,7 +74,7 @@ npm.cmd run build
 
 Expected: production build exits 0 and `dashboard/dist/telemetry` does not exist.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 Run:
 
@@ -91,11 +91,11 @@ git commit -m "fix: keep telemetry out of dashboard build"
 - Register: `project_config.yaml`
 - Register: `test_results/2026-06-03_checkpoint_path_config_fix.md`
 
-- [ ] **Step 1: Add a failing Rust test**
+- [x] **Step 1: Add a failing Rust test**
 
 Add a trainer test that resumes from a non-default checkpoint path and asserts the selected save path is the resume path. Add a core config assertion that `AgentConfig::default().trainer_checkpoint_path` matches the configured checkpoint path.
 
-- [ ] **Step 2: Run targeted test and verify red**
+- [x] **Step 2: Run targeted test and verify red**
 
 Run:
 
@@ -105,11 +105,11 @@ docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05
 
 Expected: fails before implementation because trainer save path always uses the hardcoded default.
 
-- [ ] **Step 3: Implement stable path selection**
+- [x] **Step 3: Implement stable path selection**
 
 Add `trainer_checkpoint_path` to `AgentConfig`, mirror `project_config.yaml`, and make `trainer_checkpoint_path(&cli, &agent_config)` return `cli.resume_checkpoint` when supplied, otherwise `agent_config.trainer_checkpoint_path`.
 
-- [ ] **Step 4: Verify green**
+- [x] **Step 4: Verify green**
 
 Run:
 
@@ -119,7 +119,7 @@ docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05
 
 Expected: targeted tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
@@ -134,19 +134,19 @@ git commit -m "fix: respect configured trainer checkpoint path"
 - Modify: `crates/orbit-wars-trainer/src/main.rs`
 - Register: `test_results/2026-06-03_hot_loop_allocation_cleanup.md`
 
-- [ ] **Step 1: Add targeted tests for unchanged decode sample-index behavior**
+- [x] **Step 1: Add targeted tests for unchanged decode sample-index behavior**
 
 Add or extend a trainer unit test that records action traces with sample indices and confirms indices are consecutive when samples are captured.
 
-- [ ] **Step 2: Replace per-turn sample-index vectors**
+- [x] **Step 2: Replace per-turn sample-index vectors**
 
 Pass `first_sample_index: Option<usize>` into `decode_outputs_into_actions` and compute `first + request_index` locally instead of allocating a `Vec<usize>` every turn.
 
-- [ ] **Step 3: Reuse `requests_per_game` inside `run_games_batched`**
+- [x] **Step 3: Reuse `requests_per_game` inside `run_games_batched`**
 
 Move `requests_per_game` allocation outside the turn loop and reset it with `fill(0)` each turn.
 
-- [ ] **Step 4: Verify Rust workspace**
+- [x] **Step 4: Verify Rust workspace**
 
 Run:
 
@@ -156,7 +156,7 @@ docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05
 
 Expected: all Rust tests pass.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 Run:
 
