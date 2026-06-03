@@ -1,8 +1,8 @@
 # index.md
 
-timestamp=2026-06-03T18:01:08+03:00
+timestamp=2026-06-03T18:10:50+03:00
 index_scope=working_navigation
-active_task_id=2026-06-03_replay_frame_sharing
+active_task_id=2026-06-03_lightweight_replay_history
 
 ## How To Use This Index
 
@@ -135,6 +135,7 @@ active_task_id=2026-06-03_replay_frame_sharing
 | `test_results/2026-06-03_population_forward_scratch.md` | Red/green and full Rust verification for reusable CUDA forward host packing scratch. |
 | `test_results/2026-06-03_live_completed_replay_storage_split.md` | Rust/dashboard/browser verification for append-only live replay storage and lazy completed replay loading. |
 | `test_results/2026-06-03_replay_frame_sharing.md` | Rust verification for sharing completed replay frame buffers across participant views. |
+| `test_results/2026-06-03_lightweight_replay_history.md` | Rust verification for storing completed replay history as chunk metadata instead of frame payloads. |
 
 ## Search Hints
 

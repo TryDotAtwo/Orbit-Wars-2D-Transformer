@@ -176,7 +176,7 @@ struct LiveReplayTelemetry<'a> {
     evolution_config: &'a EvolutionConfig,
     metrics: &'a [MetricRecord],
     generation_validation_history: &'a [GenerationValidationRecord],
-    replay_history: &'a [ReplayGame],
+    replay_history: &'a [ReplayChunkRecord],
     agent_config: &'a AgentConfig,
     cli: &'a TrainerCli,
     run_id: &'a str,
@@ -383,6 +383,13 @@ struct ReplayGame {
     game_index: usize,
     reward: i32,
     frames: Arc<Vec<ReplayFrame>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReplayChunkRecord {
+    generation: usize,
+    game_count: usize,
+    actual_game_count: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -762,7 +769,9 @@ fn main() -> Result<(), String> {
             }
             write_replay_chunk(&run_id, generation, &evaluation.replay_games)?;
             let write_seconds = elapsed_seconds(replay_write_started_at.elapsed());
-            replay_history.extend(evaluation.replay_games.clone());
+            replay_history.extend(replay_chunk_records_from_replay_games(
+                &evaluation.replay_games,
+            ));
             let replay_stats = replay_write_stats_from_evaluation(&evaluation.replay_games);
             log_trainer_event(format!(
                 "event=phase_done; run_id={run_id}; generation={generation}; phase={}; seconds={:.6}; replay_games={}; replay_write_seconds={:.6}",
@@ -2459,7 +2468,7 @@ fn reproduce_population(
 fn reproduce_population_from_champion_scores(
     champion_archive: &mut Vec<GenerationChampion>,
     champion_scores: &[EvaluatedModel],
-    replay_history: &mut Vec<ReplayGame>,
+    replay_history: &mut Vec<ReplayChunkRecord>,
     run_id: &str,
     evolution_config: &EvolutionConfig,
     agent_config: &AgentConfig,
@@ -2679,15 +2688,15 @@ fn reproduction_child_parent_sequence(parent_slots: &[usize]) -> Result<Vec<usiz
 }
 
 fn prune_replay_history_and_files(
-    replay_history: &mut Vec<ReplayGame>,
+    replay_history: &mut Vec<ReplayChunkRecord>,
     run_id: &str,
     retained_generations: &BTreeSet<usize>,
 ) -> Result<(), String> {
     let existing_generations = replay_history
         .iter()
-        .map(|game| game.generation)
+        .map(|record| record.generation)
         .collect::<BTreeSet<_>>();
-    replay_history.retain(|game| retained_generations.contains(&game.generation));
+    replay_history.retain(|record| retained_generations.contains(&record.generation));
     for generation in existing_generations {
         if !retained_generations.contains(&generation) {
             remove_replay_artifacts(run_id, generation)?;
@@ -4420,7 +4429,7 @@ fn write_progress_telemetry(
     evolution_config: &EvolutionConfig,
     metrics: &[MetricRecord],
     generation_validation_history: &[GenerationValidationRecord],
-    replay_games: &[ReplayGame],
+    replay_history: &[ReplayChunkRecord],
     agent_config: &AgentConfig,
     cli: &TrainerCli,
     run_id: &str,
@@ -4513,8 +4522,8 @@ fn write_progress_telemetry(
         generation_win_rates_json = generation_win_rates_json(generation_validation_history),
         models = progress_models_json(evolution_config.population_size),
         first_frames = first_frames,
-        replay_chunks_json = replay_chunks_json_preserving_existing(run_id, replay_games),
-        stored_replay_games = replay_games.len()
+        replay_chunks_json = replay_chunks_json_preserving_existing(run_id, replay_history),
+        stored_replay_games = replay_chunk_record_game_count(replay_history)
     );
     let path = Path::new("dashboard/public/telemetry/latest.json");
     if let Some(parent) = path.parent() {
@@ -4721,10 +4730,13 @@ fn dedup_generation_win_rate_items(
     by_key.into_values().collect()
 }
 
-fn replay_chunks_json_preserving_existing(run_id: &str, replay_games: &[ReplayGame]) -> String {
-    let excluded_generations = replay_games
+fn replay_chunks_json_preserving_existing(
+    run_id: &str,
+    replay_history: &[ReplayChunkRecord],
+) -> String {
+    let excluded_generations = replay_history
         .iter()
-        .map(|game| game.generation)
+        .map(|record| record.generation)
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -4740,7 +4752,7 @@ fn replay_chunks_json_preserving_existing(run_id: &str, replay_games: &[ReplayGa
         }
         items.push(item);
     }
-    let current = replay_chunks_json(run_id, replay_games);
+    let current = replay_chunks_json(run_id, replay_history);
     if !current.is_empty() {
         items.push(current);
     }
@@ -4880,7 +4892,7 @@ fn write_telemetry(
     evolution_config: &EvolutionConfig,
     metrics: &[MetricRecord],
     generation_validation_history: &[GenerationValidationRecord],
-    replay_games: &[ReplayGame],
+    replay_history: &[ReplayChunkRecord],
     agent_config: &AgentConfig,
     cli: &TrainerCli,
     run_id: &str,
@@ -4915,7 +4927,7 @@ fn write_telemetry(
         turn_loop = OFFICIAL_TURN_LOOP_NAME,
         full_replay = json_bool(full_replay),
         replay_frame_stride = agent_config.dashboard_replay_frame_stride,
-        stored_replay_games = replay_games.len(),
+        stored_replay_games = replay_chunk_record_game_count(replay_history),
         games_per_second = latest_metric.games_per_second,
         turns_per_second = latest_metric.turns_per_second,
         gpu_utilization = latest_metric.gpu_utilization,
@@ -4948,7 +4960,7 @@ fn write_telemetry(
             ))
             .collect::<Vec<_>>()
             .join(","),
-        replay_chunks_json = replay_chunks_json_preserving_existing(run_id, replay_games)
+        replay_chunks_json = replay_chunks_json_preserving_existing(run_id, replay_history)
     );
     let path = Path::new("dashboard/public/telemetry/latest.json");
     if let Some(parent) = path.parent() {
@@ -5400,7 +5412,7 @@ fn replay_actual_games(replay_games: &[ReplayGame]) -> Vec<Vec<&ReplayGame>> {
         .collect()
 }
 
-fn replay_chunks_json(run_id: &str, replay_games: &[ReplayGame]) -> String {
+fn replay_chunk_records_from_replay_games(replay_games: &[ReplayGame]) -> Vec<ReplayChunkRecord> {
     let mut generation_counts = BTreeMap::new();
     let mut actual_game_indices = BTreeMap::<usize, BTreeSet<usize>>::new();
     for game in replay_games {
@@ -5412,18 +5424,35 @@ fn replay_chunks_json(run_id: &str, replay_games: &[ReplayGame]) -> String {
     }
     generation_counts
         .iter()
-        .map(|(generation, game_count)| {
-            let actual_game_count = actual_game_indices
+        .map(|(generation, game_count)| ReplayChunkRecord {
+            generation: *generation,
+            game_count: *game_count,
+            actual_game_count: actual_game_indices
                 .get(generation)
                 .map(BTreeSet::len)
-                .unwrap_or_default();
+                .unwrap_or_default(),
+        })
+        .collect()
+}
+
+fn replay_chunk_record_game_count(replay_history: &[ReplayChunkRecord]) -> usize {
+    replay_history
+        .iter()
+        .map(|record| record.game_count)
+        .sum::<usize>()
+}
+
+fn replay_chunks_json(run_id: &str, replay_history: &[ReplayChunkRecord]) -> String {
+    replay_history
+        .iter()
+        .map(|record| {
             format!(
                 "{{\"generation\":{},\"path\":\"/telemetry/replays_{}_generation_{}.json\",\"gameCount\":{},\"actualGameCount\":{}}}",
-                generation,
+                record.generation,
                 run_id,
-                generation,
-                game_count,
-                actual_game_count
+                record.generation,
+                record.game_count,
+                record.actual_game_count
             )
         })
         .collect::<Vec<_>>()
@@ -6053,6 +6082,56 @@ mod tests {
         for replay_game in replay_games.iter().skip(1) {
             assert!(Arc::ptr_eq(&replay_games[0].frames, &replay_game.frames));
         }
+    }
+
+    #[test]
+    fn replay_chunk_records_keep_counts_without_frame_payloads() {
+        const CAPTURED_ACTUAL_GAMES: usize = 2;
+        let config = AgentConfig::default();
+        let assignments = game_assignments(
+            config.trainer_smoke_population_size,
+            config.trainer_smoke_games_per_model,
+            PLAYER_COUNT_FOUR,
+            &config,
+        )
+        .unwrap();
+        let state = seeded_state(&config, PLAYER_COUNT_FOUR, FIRST_GENERATION, 0).unwrap();
+        let frame = replay_frame_from_state(&state);
+        let games = assignments
+            .iter()
+            .map(|_| GameRunResult {
+                rewards: [config.training_reward_win; MAX_PLAYER_SLOTS],
+                frames: vec![frame.clone()],
+                stats: ComputeStats::default(),
+                gameplay: [GameplayStats::default(); MAX_PLAYER_SLOTS],
+            })
+            .collect::<Vec<_>>();
+        let replay_games = replay_games_from_evaluation(
+            FIRST_GENERATION,
+            &assignments,
+            &games,
+            PLAYER_COUNT_FOUR,
+            CAPTURED_ACTUAL_GAMES,
+        );
+        let records = replay_chunk_records_from_replay_games(&replay_games);
+
+        assert_eq!(
+            records,
+            vec![ReplayChunkRecord {
+                generation: FIRST_GENERATION,
+                game_count: CAPTURED_ACTUAL_GAMES * PLAYER_COUNT_FOUR,
+                actual_game_count: CAPTURED_ACTUAL_GAMES,
+            }]
+        );
+        assert_eq!(
+            replay_chunks_json("test_run", &records),
+            "{\"generation\":1,\"path\":\"/telemetry/replays_test_run_generation_1.json\",\"gameCount\":8,\"actualGameCount\":2}"
+        );
+        assert_eq!(
+            replay_chunk_record_game_count(&records),
+            CAPTURED_ACTUAL_GAMES * PLAYER_COUNT_FOUR
+        );
+        assert!(std::mem::size_of::<ReplayChunkRecord>() < std::mem::size_of::<ReplayGame>());
     }
 
     #[test]

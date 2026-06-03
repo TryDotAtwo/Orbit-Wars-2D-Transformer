@@ -281,3 +281,33 @@ docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05
 ```
 
 Result: full Rust workspace passed.
+
+### Task 9: Keep Long-Lived Replay History Lightweight
+
+**Files:**
+- Modify: `crates/orbit-wars-trainer/src/main.rs`
+- Register: `test_results/2026-06-03_lightweight_replay_history.md`
+
+- [x] **Step 1: Add a failing metadata-history test**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo test -p orbit-wars-trainer replay_chunk_records_keep_counts_without_frame_payloads -- --nocapture"
+```
+
+Result: RED before implementation because `ReplayChunkRecord` and the conversion helper did not exist.
+
+- [x] **Step 2: Replace long-lived full replay history**
+
+Changed trainer `replay_history` to store `ReplayChunkRecord` values after `write_replay_chunk`, while completed chunks and generation logs still use full `evaluation.replay_games` before those payloads are dropped.
+
+- [x] **Step 3: Verify**
+
+Run:
+
+```powershell
+docker run --rm -v "<workspace>:/workspace" -w /workspace cmz-native-dev:2026-05-26 bash -lc "cargo fmt --all && cargo test --workspace"
+```
+
+Result: full Rust workspace passed.
