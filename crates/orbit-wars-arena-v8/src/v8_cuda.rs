@@ -20,6 +20,7 @@ const SIM_CLEAR_ACTIONS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_clear_actions\0";
 const SIM_STEP_DEVICE_ACTIONS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_step_device_actions\0";
 const SIM_READ_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read\0";
 const SIM_READ_PLANETS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_planets_stats\0";
+const SIM_READ_STATUS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_status_stats\0";
 const RESIDENT_MODEL_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_model_decode\0";
 const DEFAULT_CUDA_V8_LIBRARY_PATH: &str = "target/liborbit_wars_v8_cuda.so";
 const TOKEN_FEATURES: usize = 14;
@@ -101,6 +102,7 @@ pub struct OrbitWarsCudaSimConfig {
     max_players: usize,
     max_actions_per_player: usize,
     step: i32,
+    episode_steps: i32,
     angular_velocity: f32,
     board_size: f32,
     board_center: f32,
@@ -125,6 +127,14 @@ pub struct OrbitWarsCudaSimStats {
     pub out_of_bounds_destroyed_ship_count: i32,
     pub captured_planet_count: i32,
     pub overflow_fleet_count: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrbitWarsCudaGameStatus {
+    pub done: i32,
+    pub winner: i32,
+    pub step: i32,
 }
 
 impl From<Planet> for OrbitWarsCudaPlanet {
@@ -216,6 +226,7 @@ impl OrbitWarsCudaSimConfig {
             max_players,
             max_actions_per_player,
             step: step as i32,
+            episode_steps: config.episode_steps as i32,
             angular_velocity,
             board_size: config.board_size,
             board_center: config.board_center,
@@ -317,6 +328,11 @@ type SimReadPlanetsStatsFn = unsafe extern "C" fn(
     next_fleet_ids: *mut i32,
     stats: *mut OrbitWarsCudaSimStats,
 ) -> OrbitWarsV8CudaStatus;
+type SimReadStatusStatsFn = unsafe extern "C" fn(
+    state: *mut c_void,
+    statuses: *mut OrbitWarsCudaGameStatus,
+    stats: *mut OrbitWarsCudaSimStats,
+) -> OrbitWarsV8CudaStatus;
 type ResidentModelDecodeFn = unsafe extern "C" fn(
     model: *mut c_void,
     state: *mut c_void,
@@ -344,6 +360,7 @@ pub struct V8Cuda {
     sim_step_device_actions_fn: SimStepDeviceActionsFn,
     sim_read_fn: SimReadFn,
     sim_read_planets_stats_fn: SimReadPlanetsStatsFn,
+    sim_read_status_stats_fn: SimReadStatusStatsFn,
     resident_model_decode_fn: ResidentModelDecodeFn,
 }
 
@@ -435,6 +452,11 @@ impl V8Cuda {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_sim_read_planets_stats_symbol_missing={}", dlerror_text()));
         }
+        let sim_read_status_stats_fn = unsafe { dlsym(handle, SIM_READ_STATUS_STATS_SYMBOL.as_ptr() as *const c_char) };
+        if sim_read_status_stats_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_sim_read_status_stats_symbol_missing={}", dlerror_text()));
+        }
         let resident_model_decode_fn = unsafe { dlsym(handle, RESIDENT_MODEL_DECODE_SYMBOL.as_ptr() as *const c_char) };
         if resident_model_decode_fn.is_null() {
             unsafe { dlclose(handle) };
@@ -457,6 +479,7 @@ impl V8Cuda {
             sim_step_device_actions_fn: unsafe { std::mem::transmute::<*mut c_void, SimStepDeviceActionsFn>(sim_step_device_actions_fn) },
             sim_read_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadFn>(sim_read_fn) },
             sim_read_planets_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadPlanetsStatsFn>(sim_read_planets_stats_fn) },
+            sim_read_status_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadStatusStatsFn>(sim_read_status_stats_fn) },
             resident_model_decode_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelDecodeFn>(resident_model_decode_fn) },
         })
     }
@@ -737,6 +760,21 @@ impl CudaSimState<'_> {
             )
         };
         require_ok(status, "cuda_sim_read_planets_stats")
+    }
+
+    pub fn read_status_stats(
+        &self,
+        statuses: &mut [OrbitWarsCudaGameStatus],
+        stats: &mut [OrbitWarsCudaSimStats],
+    ) -> Result<(), String> {
+        let status = unsafe {
+            (self.cuda.sim_read_status_stats_fn)(
+                self.pointer,
+                statuses.as_mut_ptr(),
+                stats.as_mut_ptr(),
+            )
+        };
+        require_ok(status, "cuda_sim_read_status_stats")
     }
 }
 

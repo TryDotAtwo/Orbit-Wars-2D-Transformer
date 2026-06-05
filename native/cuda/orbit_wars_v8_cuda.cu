@@ -166,6 +166,7 @@ struct CudaSimState {
   DeviceBuffer<OrbitWarsCudaAction> actions;
   DeviceBuffer<int> action_counts;
   DeviceBuffer<OrbitWarsCudaSimStats> stats;
+  DeviceBuffer<OrbitWarsCudaGameStatus> statuses;
   DeviceBuffer<int> arrivals;
   DeviceBuffer<float> old_x;
   DeviceBuffer<float> old_y;
@@ -184,6 +185,7 @@ struct CudaSimKernelState {
   OrbitWarsCudaAction* actions;
   int* action_counts;
   OrbitWarsCudaSimStats* stats;
+  OrbitWarsCudaGameStatus* statuses;
   int* arrivals;
   float* old_x;
   float* old_y;
@@ -203,6 +205,7 @@ CudaSimKernelState sim_kernel_state(CudaSimState* state) {
       state->actions.ptr,
       state->action_counts.ptr,
       state->stats.ptr,
+      state->statuses.ptr,
       state->arrivals.ptr,
       state->old_x.ptr,
       state->old_y.ptr,
@@ -1088,16 +1091,20 @@ __global__ void resident_decode_actions_kernel(
   if (request >= request_count) return;
   const int game = request_game_indices[request];
   const int player = request_player_ids[request];
+  if (sim.statuses && sim.statuses[game].done) return;
   OrbitWarsCudaPlanet* planets = sim.planets + static_cast<size_t>(game) * sim.config.planet_count;
   OrbitWarsCudaAction* actions = sim.actions + (static_cast<size_t>(game) * sim.config.max_players + player) * sim.config.max_actions_per_player;
   int* action_count = sim.action_counts + game * sim.config.max_players + player;
   bool used_sources[PLANETS];
   for (int index = 0; index < PLANETS; ++index) used_sources[index] = false;
+  bool used_slots[ACTION_SLOTS];
+  for (int index = 0; index < ACTION_SLOTS; ++index) used_slots[index] = false;
   int written = 0;
   for (int slot_pick = 0; slot_pick < ACTION_SLOTS && written < static_cast<int>(sim.config.max_actions_per_player); ++slot_pick) {
     int best_slot = -1;
     float best_fire = -INFINITY;
     for (int slot = 0; slot < ACTION_SLOTS; ++slot) {
+      if (used_slots[slot]) continue;
       const float value = fire_logits[request * ACTION_SLOTS + slot];
       if (!isfinite(value) || value <= 0.0f) continue;
       if (value > best_fire) {
@@ -1106,29 +1113,28 @@ __global__ void resident_decode_actions_kernel(
       }
     }
     if (best_slot < 0) break;
-    fire_logits = fire_logits;  // keeps compiler from warning when slot selection exits early in optimized builds
+    used_slots[best_slot] = true;
     const float* source_row_logits = source_logits + (request * ACTION_SLOTS + best_slot) * PLANETS;
     const int source_row = resident_argmax(source_row_logits, PLANETS, -1);
-    if (source_row < 0 || source_row >= PLANETS || used_sources[source_row]) break;
+    if (source_row < 0 || source_row >= PLANETS || used_sources[source_row]) continue;
     OrbitWarsCudaPlanet source = planets[source_row];
-    if (source.id < 0 || source.owner != player || source.ships < 1.0f) break;
+    if (source.id < 0 || source.owner != player || source.ships < 1.0f) continue;
     const float* target_row_logits = target_logits + (request * ACTION_SLOTS + best_slot) * PLANETS;
     const int target_row = resident_argmax(target_row_logits, PLANETS, source_row);
-    if (target_row < 0 || target_row >= PLANETS) break;
+    if (target_row < 0 || target_row >= PLANETS) continue;
     OrbitWarsCudaPlanet target = planets[target_row];
-    if (target.id < 0) break;
+    if (target.id < 0) continue;
     const float* amount_row_logits = amount_logits + (request * ACTION_SLOTS + best_slot) * AMOUNTS;
     const int amount_index = resident_argmax(amount_row_logits, AMOUNTS, -1);
-    if (amount_index < 0) break;
+    if (amount_index < 0) continue;
     const int ships = resident_amount_ships(amount_index, source.ships);
-    if (ships < 1) break;
+    if (ships < 1) continue;
     actions[written] = OrbitWarsCudaAction{
         source.id,
         atan2f(target.y - source.y, target.x - source.x),
         ships};
     used_sources[source_row] = true;
     written += 1;
-    break;
   }
   *action_count = written;
 }
@@ -1406,6 +1412,10 @@ __global__ void sim_prepare_kernel(CudaSimKernelState state, int step) {
     state.arrivals[index] = 0;
   }
   if (index < static_cast<int>(config.game_count)) {
+    if (state.statuses && state.statuses[index].done) {
+      state.fleet_counts[index] = 0;
+      return;
+    }
     int count = 0;
     OrbitWarsCudaFleet* fleets = state.fleets + static_cast<size_t>(index) * config.max_fleets_per_game;
     for (int fleet = 0; fleet < static_cast<int>(config.max_fleets_per_game); ++fleet) {
@@ -1430,6 +1440,9 @@ __global__ void sim_apply_actions_kernel(CudaSimKernelState state) {
   const int action_index = flat % static_cast<int>(config.max_actions_per_player);
   const int player = (flat / static_cast<int>(config.max_actions_per_player)) % static_cast<int>(config.max_players);
   const int game = flat / static_cast<int>(config.max_actions_per_player * config.max_players);
+  if (state.statuses && state.statuses[game].done) {
+    return;
+  }
   const int count = state.action_counts[game * config.max_players + player];
   if (action_index >= count) {
     return;
@@ -1478,6 +1491,9 @@ __global__ void sim_produce_rotate_kernel(CudaSimKernelState state) {
     return;
   }
   const int game = flat / static_cast<int>(config.planet_count);
+  if (state.statuses && state.statuses[game].done) {
+    return;
+  }
   const int planet = flat % static_cast<int>(config.planet_count);
   OrbitWarsCudaPlanet* planets = state.planets + static_cast<size_t>(game) * config.planet_count;
   const OrbitWarsCudaPlanet* initial_planets = state.initial_planets + static_cast<size_t>(game) * config.planet_count;
@@ -1515,6 +1531,9 @@ __global__ void sim_move_fleets_kernel(CudaSimKernelState state) {
     return;
   }
   const int game = flat / static_cast<int>(config.max_fleets_per_game);
+  if (state.statuses && state.statuses[game].done) {
+    return;
+  }
   const int fleet_index = flat % static_cast<int>(config.max_fleets_per_game);
   OrbitWarsCudaFleet* fleets = state.fleets + static_cast<size_t>(game) * config.max_fleets_per_game;
   OrbitWarsCudaFleet fleet = fleets[fleet_index];
@@ -1583,6 +1602,9 @@ __global__ void sim_apply_planets_resolve_kernel(CudaSimKernelState state) {
     return;
   }
   const int game = flat / static_cast<int>(config.planet_count);
+  if (state.statuses && state.statuses[game].done) {
+    return;
+  }
   const int planet = flat % static_cast<int>(config.planet_count);
   OrbitWarsCudaPlanet* planets = state.planets + static_cast<size_t>(game) * config.planet_count;
   OrbitWarsCudaPlanet& item = planets[planet];
@@ -1622,6 +1644,59 @@ __global__ void sim_apply_planets_resolve_kernel(CudaSimKernelState state) {
   }
 }
 
+__global__ void sim_update_status_kernel(CudaSimKernelState state, int step_after) {
+  const OrbitWarsCudaSimConfig config = state.config;
+  const int game = blockIdx.x * blockDim.x + threadIdx.x;
+  if (game >= static_cast<int>(config.game_count) || !state.statuses) {
+    return;
+  }
+  OrbitWarsCudaGameStatus& status = state.statuses[game];
+  if (status.done) {
+    return;
+  }
+  bool alive[4] = {false, false, false, false};
+  int scores[4] = {0, 0, 0, 0};
+  OrbitWarsCudaPlanet* planets = state.planets + static_cast<size_t>(game) * config.planet_count;
+  for (int planet = 0; planet < static_cast<int>(config.planet_count); ++planet) {
+    const int owner = planets[planet].owner;
+    if (owner >= 0 && owner < static_cast<int>(config.max_players) && owner < 4) {
+      alive[owner] = true;
+      scores[owner] += static_cast<int>(floorf(planets[planet].ships));
+    }
+  }
+  OrbitWarsCudaFleet* fleets = state.fleets + static_cast<size_t>(game) * config.max_fleets_per_game;
+  for (int fleet = 0; fleet < static_cast<int>(config.max_fleets_per_game); ++fleet) {
+    if (!fleets[fleet].alive) continue;
+    const int owner = fleets[fleet].owner;
+    if (owner >= 0 && owner < static_cast<int>(config.max_players) && owner < 4) {
+      alive[owner] = true;
+      scores[owner] += static_cast<int>(floorf(fleets[fleet].ships));
+    }
+  }
+  int alive_count = 0;
+  for (int player = 0; player < static_cast<int>(config.max_players) && player < 4; ++player) {
+    if (alive[player]) alive_count += 1;
+  }
+  status.step = step_after;
+  if (step_after < config.episode_steps && alive_count > 1) {
+    return;
+  }
+  int best_score = -2147483647;
+  int best_player = -1;
+  int best_count = 0;
+  for (int player = 0; player < static_cast<int>(config.max_players) && player < 4; ++player) {
+    if (scores[player] > best_score) {
+      best_score = scores[player];
+      best_player = player;
+      best_count = 1;
+    } else if (scores[player] == best_score) {
+      best_count += 1;
+    }
+  }
+  status.done = 1;
+  status.winner = best_count == 1 ? best_player : -1;
+}
+
 cudaError_t sim_allocate_state(CudaSimState* state) {
   const auto& config = state->config;
   cudaError_t error = state->planets.allocate(config.game_count * config.planet_count);
@@ -1641,6 +1716,8 @@ cudaError_t sim_allocate_state(CudaSimState* state) {
   error = state->action_counts.allocate(config.game_count * config.max_players);
   if (error != cudaSuccess) return error;
   error = state->stats.allocate(config.game_count * config.max_players);
+  if (error != cudaSuccess) return error;
+  error = state->statuses.allocate(config.game_count);
   if (error != cudaSuccess) return error;
   error = state->arrivals.allocate(config.game_count * config.planet_count * config.max_players);
   if (error != cudaSuccess) return error;
@@ -1823,6 +1900,8 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_load_with_angular_velocitie
   }
   error = cudaMemset(state->stats.ptr, 0, sizeof(OrbitWarsCudaSimStats) * config.game_count * config.max_players);
   if (error != cudaSuccess) return cuda_error(error);
+  error = cudaMemset(state->statuses.ptr, 0, sizeof(OrbitWarsCudaGameStatus) * config.game_count);
+  if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
 
@@ -1892,6 +1971,9 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_device_actions(
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   sim_apply_planets_resolve_kernel<<<blocks_for(static_cast<int>(config.game_count * config.planet_count)), 256>>>(kernel_state);
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return cuda_error(error);
+  sim_update_status_kernel<<<blocks_for(static_cast<int>(config.game_count)), 256>>>(kernel_state, step + 1);
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   error = cudaDeviceSynchronize();
@@ -2011,6 +2093,22 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_planets_stats(
   cudaError_t error = state->planets.copy_to_host(planets, config.game_count * config.planet_count);
   if (error != cudaSuccess) return cuda_error(error);
   error = state->next_fleet_ids.copy_to_host(next_fleet_ids, config.game_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = state->stats.copy_to_host(stats, config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
+  return ok();
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_status_stats(
+    OrbitWarsCudaSimState* opaque,
+    OrbitWarsCudaGameStatus* statuses,
+    OrbitWarsCudaSimStats* stats) {
+  if (!opaque || !statuses || !stats) {
+    return bad_argument("null persistent sim status read argument");
+  }
+  auto* state = reinterpret_cast<CudaSimState*>(opaque);
+  const auto& config = state->config;
+  cudaError_t error = state->statuses.copy_to_host(statuses, config.game_count);
   if (error != cudaSuccess) return cuda_error(error);
   error = state->stats.copy_to_host(stats, config.game_count * config.max_players);
   if (error != cudaSuccess) return cuda_error(error);

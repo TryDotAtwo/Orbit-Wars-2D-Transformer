@@ -69,6 +69,7 @@ typedef struct OrbitWarsCudaSimConfig {
   size_t max_players;
   size_t max_actions_per_player;
   int step;
+  int episode_steps;
   float angular_velocity;
   float board_size;
   float board_center;
@@ -92,6 +93,12 @@ typedef struct OrbitWarsCudaSimStats {
   int captured_planet_count;
   int overflow_fleet_count;
 } OrbitWarsCudaSimStats;
+
+typedef struct OrbitWarsCudaGameStatus {
+  int done;
+  int winner;
+  int step;
+} OrbitWarsCudaGameStatus;
 
 OrbitWarsV8CudaStatus orbit_wars_cuda_v8_status(void);
 
@@ -158,6 +165,11 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_planets_stats(
     OrbitWarsCudaSimState* state,
     OrbitWarsCudaPlanet* planets,
     int* next_fleet_ids,
+    OrbitWarsCudaSimStats* stats);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_status_stats(
+    OrbitWarsCudaSimState* state,
+    OrbitWarsCudaGameStatus* statuses,
     OrbitWarsCudaSimStats* stats);
 
 OrbitWarsV8CudaStatus orbit_wars_cuda_v8_model_create(

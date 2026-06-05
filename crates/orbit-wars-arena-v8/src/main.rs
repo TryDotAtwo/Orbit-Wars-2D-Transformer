@@ -109,6 +109,7 @@ struct ActiveModelGame {
     participant_models: Vec<usize>,
     player_stats: Vec<PlayerStats>,
     done: bool,
+    winner_player: Option<usize>,
 }
 
 fn main() -> Result<(), String> {
@@ -698,6 +699,7 @@ fn run_cuda_model_game_batch(
             participant_models: participants.clone(),
             player_stats: vec![PlayerStats::default(); player_count],
             done: false,
+            winner_player: None,
         })
         .collect::<Vec<_>>();
     let mut gpu_sim_groups = if gpu_sim {
@@ -723,7 +725,6 @@ fn run_cuda_model_game_batch(
                 &requests_by_model,
                 cuda_models,
                 replay_stride,
-                config,
                 player_count,
             )?;
             if done_changed {
@@ -733,7 +734,7 @@ fn run_cuda_model_game_batch(
         }
 
         let mut tokens_by_model = vec![Vec::new(); models.len()];
-        for (game_index, game) in games.iter().enumerate() {
+        for (_game_index, game) in games.iter().enumerate() {
             if game.done {
                 continue;
             }
@@ -795,7 +796,7 @@ fn run_cuda_model_game_batch(
 
     let mut results = Vec::with_capacity(games.len());
     for mut game in games {
-        let winner_player = winner_index(&game.state, config, player_count);
+        let winner_player = game.winner_player.or_else(|| winner_index(&game.state, config, player_count));
         let winner_model = winner_player.map(|player| game.participant_models[player]);
         let mut model_stats = vec![PlayerStats::default(); models.len()];
         for player in 0..player_count {
@@ -907,6 +908,7 @@ fn step_active_model_games_range(
                 &game.participant_models,
             ));
             game.done = true;
+            game.winner_player = winner_index(&game.state, config, player_count);
         }
     }
     Ok(())
@@ -998,6 +1000,7 @@ fn step_active_model_games_gpu_sim(
                     &game.participant_models,
                 ));
                 game.done = true;
+                game.winner_player = winner_index(&game.state, config, player_count);
                 done_changed = true;
             }
         }
@@ -1011,7 +1014,6 @@ fn step_active_model_games_gpu_resident(
     requests_by_model: &[Vec<(usize, usize)>],
     cuda_models: &[v8_cuda::V8CudaModel<'_>],
     replay_stride: usize,
-    config: &AgentConfig,
     player_count: usize,
 ) -> Result<bool, String> {
     let Some(group) = groups.first_mut() else {
@@ -1020,14 +1022,31 @@ fn step_active_model_games_gpu_resident(
     if group.game_indices.is_empty() {
         return Ok(false);
     }
-    let step = games[group.game_indices[0]].state.step;
+    let Some(step) = group
+        .game_indices
+        .iter()
+        .filter_map(|&game_index| {
+            let game = &games[game_index];
+            if game.done {
+                None
+            } else {
+                Some(game.state.step)
+            }
+        })
+        .next()
+    else {
+        return Ok(false);
+    };
     let mut local_by_game = vec![usize::MAX; games.len()];
     for (local_game, &game_index) in group.game_indices.iter().enumerate() {
         local_by_game[game_index] = local_game;
+        if games[game_index].done {
+            continue;
+        }
         if games[game_index].state.step != step {
             return Err("gpu_resident_group_step_mismatch".to_string());
         }
-        if games[game_index].state.step % replay_stride == 0 {
+        if replay_stride > 0 && games[game_index].state.step % replay_stride == 0 {
             games[game_index].frames.push(frame_from_model_state(
                 &games[game_index].state,
                 &Vec::new(),
@@ -1057,24 +1076,56 @@ fn step_active_model_games_gpu_resident(
     }
     group.sim_state.step_device_actions(step)?;
 
-    let mut planets = vec![v8_cuda::OrbitWarsCudaPlanet::default(); group.game_indices.len() * group.planet_count];
-    let mut next_fleet_ids = vec![0i32; group.game_indices.len()];
+    let mut statuses = vec![v8_cuda::OrbitWarsCudaGameStatus::default(); group.game_indices.len()];
     let mut stats = vec![v8_cuda::OrbitWarsCudaSimStats::default(); group.game_indices.len() * player_count];
-    group.sim_state.read_planets_stats(&mut planets, &mut next_fleet_ids, &mut stats)?;
+    group.sim_state.read_status_stats(&mut statuses, &mut stats)?;
+    let needs_full_readback = group
+        .game_indices
+        .iter()
+        .enumerate()
+        .any(|(local_game, &game_index)| {
+            if games[game_index].done {
+                return false;
+            }
+            let status = statuses[local_game];
+            status.done != 0 || (replay_stride > 0 && (step + 1) % replay_stride == 0)
+        });
+    let mut planets = Vec::new();
+    let mut fleets = Vec::new();
+    let mut next_fleet_ids = Vec::new();
+    if needs_full_readback {
+        planets = vec![v8_cuda::OrbitWarsCudaPlanet::default(); group.game_indices.len() * group.planet_count];
+        fleets = vec![v8_cuda::OrbitWarsCudaFleet::default(); group.game_indices.len() * group.max_fleets];
+        next_fleet_ids = vec![0i32; group.game_indices.len()];
+        let mut full_stats = vec![v8_cuda::OrbitWarsCudaSimStats::default(); group.game_indices.len() * player_count];
+        group.sim_state.read(&mut planets, &mut fleets, &mut next_fleet_ids, &mut full_stats)?;
+    }
 
-    let mut done_changed = false;
     for (local_game, &game_index) in group.game_indices.iter().enumerate() {
         let game = &mut games[game_index];
-        let planet_start = local_game * group.planet_count;
-        let real_planet_count = group.planet_counts[local_game];
-        game.state.planets = planets[planet_start..planet_start + real_planet_count]
-            .iter()
-            .copied()
-            .map(Planet::from)
-            .collect();
-        game.state.fleets.clear();
-        game.state.next_fleet_id = next_fleet_ids[local_game];
-        game.state.step += 1;
+        if game.done {
+            continue;
+        }
+        if needs_full_readback {
+            let planet_start = local_game * group.planet_count;
+            let fleet_start = local_game * group.max_fleets;
+            let real_planet_count = group.planet_counts[local_game];
+            game.state.planets = planets[planet_start..planet_start + real_planet_count]
+                .iter()
+                .copied()
+                .map(Planet::from)
+                .collect();
+            game.state.fleets = fleets[fleet_start..fleet_start + group.max_fleets]
+                .iter()
+                .copied()
+                .filter(|fleet| fleet.alive != 0)
+                .map(Fleet::from)
+                .collect();
+            game.state.next_fleet_id = next_fleet_ids[local_game];
+        } else {
+            game.state.fleets.clear();
+        }
+        game.state.step = statuses[local_game].step.max((step + 1) as i32) as usize;
         for player in 0..player_count {
             let event = stats[local_game * player_count + player];
             game.player_stats[player].launch_actions += event.launched_fleet_count as usize;
@@ -1085,7 +1136,14 @@ fn step_active_model_games_gpu_resident(
             game.player_stats[player].sun_destroyed_fleets += event.sun_destroyed_fleet_count as usize;
             game.player_stats[player].sun_destroyed_ships += event.sun_destroyed_ship_count as i64;
         }
-        if is_terminal_fast_resident(&game.state, config) {
+        if replay_stride > 0 && game.state.step % replay_stride == 0 && statuses[local_game].done == 0 {
+            game.frames.push(frame_from_model_state(
+                &game.state,
+                &Vec::new(),
+                &game.participant_models,
+            ));
+        }
+        if statuses[local_game].done != 0 {
             game.frames.push(frame_from_model_state(
                 &game.state,
                 &Vec::new(),
@@ -1093,25 +1151,15 @@ fn step_active_model_games_gpu_resident(
             ));
             if !game.done {
                 game.done = true;
-                done_changed = true;
+                game.winner_player = if statuses[local_game].winner >= 0 {
+                    Some(statuses[local_game].winner as usize)
+                } else {
+                    None
+                };
             }
         }
     }
-    Ok(done_changed)
-}
-
-fn is_terminal_fast_resident(state: &SimulationState, config: &AgentConfig) -> bool {
-    if state.step >= config.episode_steps {
-        return true;
-    }
-    let mut owners = [false; PLAYER_COUNT_FOUR];
-    for planet in state.planets.iter().filter(|planet| planet.owner >= 0) {
-        let owner = planet.owner as usize;
-        if owner < owners.len() {
-            owners[owner] = true;
-        }
-    }
-    owners.into_iter().filter(|alive| *alive).count() <= 1
+    Ok(false)
 }
 
 fn create_gpu_sim_groups<'a>(
