@@ -1,0 +1,37 @@
+services:
+  trainer:
+    image: orbit-wars-gpu-trainer:cuda125
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      PYTHONUNBUFFERED: "1"
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - .:/workspace
+      - ./data:/workspace/data
+      - ./runs:/workspace/runs
+      - ./test_results:/workspace/test_results
+    working_dir: /workspace
+    command: ["python3", "-u", "tools/v8_train.py", "--help"]
+
+  dashboard:
+    image: orbit-wars-gpu-trainer:cuda125
+    depends_on:
+      - trainer
+    volumes:
+      - .:/workspace
+      - ./runs:/workspace/runs
+      - ./dashboard/public/telemetry:/workspace/dashboard/public/telemetry
+    working_dir: /workspace/dashboard
+    ports:
+      - "5173:5173"
+    command: ["npm", "run", "dev", "--", "--host", "0.0.0.0"]

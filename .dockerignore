@@ -1,0 +1,16 @@
+.git
+.agents
+.codex
+Реплеи_Лидера
+dashboard/node_modules
+dashboard/dist
+target
+build
+runs
+test_results
+data
+*.pyc
+__pycache__
+*.prof
+*.qdrep
+*.nsys-rep

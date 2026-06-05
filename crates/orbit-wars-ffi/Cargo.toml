@@ -1,0 +1,12 @@
+﻿[package]
+name = "orbit-wars-ffi"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+orbit-wars-core = { path = "../orbit-wars-core" }
