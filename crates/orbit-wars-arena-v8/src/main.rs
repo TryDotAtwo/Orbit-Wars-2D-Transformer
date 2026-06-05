@@ -17,6 +17,7 @@ const DEFAULT_OUTPUT: &str = "dashboard/public/telemetry/latest.json";
 const PLAYER_COUNT_FOUR: usize = 4;
 const PLAYER_IDS: [i32; PLAYER_COUNT_FOUR] = [0, 1, 2, 3];
 const GPU_SIM_PLANETS: usize = 64;
+const GPU_RESIDENT_STATUS_POLL_STRIDE: usize = 16;
 const MAP_SEED_BASE: u64 = 0x4f_57_4d_41_50;
 const MAP_GENERATION_SEED_FACTOR: u64 = 1_000_003;
 const MAP_GAME_SEED_FACTOR: u64 = 9_176;
@@ -824,6 +825,7 @@ struct GpuSimGroup<'a> {
     planet_count: usize,
     max_fleets: usize,
     max_actions_per_player: usize,
+    step: usize,
 }
 
 fn step_active_model_games(
@@ -1022,31 +1024,17 @@ fn step_active_model_games_gpu_resident(
     if group.game_indices.is_empty() {
         return Ok(false);
     }
-    let Some(step) = group
-        .game_indices
-        .iter()
-        .filter_map(|&game_index| {
-            let game = &games[game_index];
-            if game.done {
-                None
-            } else {
-                Some(game.state.step)
-            }
-        })
-        .next()
-    else {
+    if group.game_indices.iter().all(|&game_index| games[game_index].done) {
         return Ok(false);
-    };
+    }
+    let step = group.step;
     let mut local_by_game = vec![usize::MAX; games.len()];
     for (local_game, &game_index) in group.game_indices.iter().enumerate() {
         local_by_game[game_index] = local_game;
         if games[game_index].done {
             continue;
         }
-        if games[game_index].state.step != step {
-            return Err("gpu_resident_group_step_mismatch".to_string());
-        }
-        if replay_stride > 0 && games[game_index].state.step % replay_stride == 0 {
+        if step == 0 && replay_stride > 0 {
             games[game_index].frames.push(frame_from_model_state(
                 &games[game_index].state,
                 &Vec::new(),
@@ -1075,7 +1063,14 @@ fn step_active_model_games_gpu_resident(
         cuda_models[model_id].resident_decode(&group.sim_state, &request_games, &request_players, step)?;
     }
     group.sim_state.step_device_actions(step)?;
+    group.step += 1;
 
+    let next_step = group.step;
+    let should_poll_status = next_step % GPU_RESIDENT_STATUS_POLL_STRIDE == 0
+        || (replay_stride > 0 && next_step % replay_stride == 0);
+    if !should_poll_status {
+        return Ok(false);
+    }
     let mut statuses = vec![v8_cuda::OrbitWarsCudaGameStatus::default(); group.game_indices.len()];
     let mut stats = vec![v8_cuda::OrbitWarsCudaSimStats::default(); group.game_indices.len() * player_count];
     group.sim_state.read_status_stats(&mut statuses, &mut stats)?;
@@ -1088,7 +1083,7 @@ fn step_active_model_games_gpu_resident(
                 return false;
             }
             let status = statuses[local_game];
-            status.done != 0 || (replay_stride > 0 && (step + 1) % replay_stride == 0)
+            status.done != 0 || (replay_stride > 0 && next_step % replay_stride == 0)
         });
     let mut planets = Vec::new();
     let mut fleets = Vec::new();
@@ -1125,7 +1120,7 @@ fn step_active_model_games_gpu_resident(
         } else {
             game.state.fleets.clear();
         }
-        game.state.step = statuses[local_game].step.max((step + 1) as i32) as usize;
+        game.state.step = statuses[local_game].step.max(next_step as i32) as usize;
         for player in 0..player_count {
             let event = stats[local_game * player_count + player];
             game.player_stats[player].launch_actions += event.launched_fleet_count as usize;
@@ -1178,13 +1173,14 @@ fn create_gpu_sim_groups<'a>(
     if game_indices.is_empty() {
         return Ok(Vec::new());
     }
+    let initial_step = games[game_indices[0]].state.step;
     let sim_config = v8_cuda::OrbitWarsCudaSimConfig::new(
         game_indices.len(),
         GPU_SIM_PLANETS,
         max_fleets,
         player_count,
         max_actions_per_player,
-        games[game_indices[0]].state.step,
+        initial_step,
         games[game_indices[0]].state.angular_velocity,
         config,
     );
@@ -1231,6 +1227,7 @@ fn create_gpu_sim_groups<'a>(
         planet_count: GPU_SIM_PLANETS,
         max_fleets,
         max_actions_per_player,
+        step: initial_step,
     }])
 }
 

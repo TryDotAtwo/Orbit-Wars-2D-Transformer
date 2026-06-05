@@ -166,6 +166,7 @@ struct CudaSimState {
   DeviceBuffer<OrbitWarsCudaAction> actions;
   DeviceBuffer<int> action_counts;
   DeviceBuffer<OrbitWarsCudaSimStats> stats;
+  DeviceBuffer<OrbitWarsCudaSimStats> cumulative_stats;
   DeviceBuffer<OrbitWarsCudaGameStatus> statuses;
   DeviceBuffer<int> arrivals;
   DeviceBuffer<float> old_x;
@@ -185,6 +186,7 @@ struct CudaSimKernelState {
   OrbitWarsCudaAction* actions;
   int* action_counts;
   OrbitWarsCudaSimStats* stats;
+  OrbitWarsCudaSimStats* cumulative_stats;
   OrbitWarsCudaGameStatus* statuses;
   int* arrivals;
   float* old_x;
@@ -205,6 +207,7 @@ CudaSimKernelState sim_kernel_state(CudaSimState* state) {
       state->actions.ptr,
       state->action_counts.ptr,
       state->stats.ptr,
+      state->cumulative_stats.ptr,
       state->statuses.ptr,
       state->arrivals.ptr,
       state->old_x.ptr,
@@ -1697,6 +1700,29 @@ __global__ void sim_update_status_kernel(CudaSimKernelState state, int step_afte
   status.winner = best_count == 1 ? best_player : -1;
 }
 
+__device__ void add_sim_stats(OrbitWarsCudaSimStats& dst, const OrbitWarsCudaSimStats& src) {
+  dst.launched_fleet_count += src.launched_fleet_count;
+  dst.launched_ship_count += src.launched_ship_count;
+  dst.captured_planet_count += src.captured_planet_count;
+  dst.hit_fleet_count += src.hit_fleet_count;
+  dst.hit_ship_count += src.hit_ship_count;
+  dst.out_of_bounds_destroyed_fleet_count += src.out_of_bounds_destroyed_fleet_count;
+  dst.out_of_bounds_destroyed_ship_count += src.out_of_bounds_destroyed_ship_count;
+  dst.sun_destroyed_fleet_count += src.sun_destroyed_fleet_count;
+  dst.sun_destroyed_ship_count += src.sun_destroyed_ship_count;
+  dst.overflow_fleet_count += src.overflow_fleet_count;
+}
+
+__global__ void sim_accumulate_stats_kernel(CudaSimKernelState state) {
+  const OrbitWarsCudaSimConfig config = state.config;
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int stats_total = static_cast<int>(config.game_count * config.max_players);
+  if (index >= stats_total || !state.cumulative_stats) {
+    return;
+  }
+  add_sim_stats(state.cumulative_stats[index], state.stats[index]);
+}
+
 cudaError_t sim_allocate_state(CudaSimState* state) {
   const auto& config = state->config;
   cudaError_t error = state->planets.allocate(config.game_count * config.planet_count);
@@ -1716,6 +1742,8 @@ cudaError_t sim_allocate_state(CudaSimState* state) {
   error = state->action_counts.allocate(config.game_count * config.max_players);
   if (error != cudaSuccess) return error;
   error = state->stats.allocate(config.game_count * config.max_players);
+  if (error != cudaSuccess) return error;
+  error = state->cumulative_stats.allocate(config.game_count * config.max_players);
   if (error != cudaSuccess) return error;
   error = state->statuses.allocate(config.game_count);
   if (error != cudaSuccess) return error;
@@ -1900,6 +1928,8 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_load_with_angular_velocitie
   }
   error = cudaMemset(state->stats.ptr, 0, sizeof(OrbitWarsCudaSimStats) * config.game_count * config.max_players);
   if (error != cudaSuccess) return cuda_error(error);
+  error = cudaMemset(state->cumulative_stats.ptr, 0, sizeof(OrbitWarsCudaSimStats) * config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
   error = cudaMemset(state->statuses.ptr, 0, sizeof(OrbitWarsCudaGameStatus) * config.game_count);
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
@@ -1976,7 +2006,8 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_device_actions(
   sim_update_status_kernel<<<blocks_for(static_cast<int>(config.game_count)), 256>>>(kernel_state, step + 1);
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
-  error = cudaDeviceSynchronize();
+  sim_accumulate_stats_kernel<<<blocks_for(static_cast<int>(config.game_count * config.max_players)), 256>>>(kernel_state);
+  error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
@@ -2053,8 +2084,6 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
       workspace.d_amount.ptr);
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
-  error = cudaDeviceSynchronize();
-  if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
 
@@ -2075,7 +2104,9 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read(
   if (error != cudaSuccess) return cuda_error(error);
   error = state->next_fleet_ids.copy_to_host(next_fleet_ids, config.game_count);
   if (error != cudaSuccess) return cuda_error(error);
-  error = state->stats.copy_to_host(stats, config.game_count * config.max_players);
+  error = state->cumulative_stats.copy_to_host(stats, config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = cudaMemset(state->cumulative_stats.ptr, 0, sizeof(OrbitWarsCudaSimStats) * config.game_count * config.max_players);
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
@@ -2094,7 +2125,9 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_planets_stats(
   if (error != cudaSuccess) return cuda_error(error);
   error = state->next_fleet_ids.copy_to_host(next_fleet_ids, config.game_count);
   if (error != cudaSuccess) return cuda_error(error);
-  error = state->stats.copy_to_host(stats, config.game_count * config.max_players);
+  error = state->cumulative_stats.copy_to_host(stats, config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = cudaMemset(state->cumulative_stats.ptr, 0, sizeof(OrbitWarsCudaSimStats) * config.game_count * config.max_players);
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
