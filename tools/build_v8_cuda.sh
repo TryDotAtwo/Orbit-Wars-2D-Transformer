@@ -4,6 +4,7 @@ set -euo pipefail
 mkdir -p target
 nvcc -std=c++17 -O3 -shared -Xcompiler -fPIC \
   native/cuda/orbit_wars_v8_cuda.cu \
+  -lcublas \
   -o target/liborbit_wars_v8_cuda.so
 g++ -std=c++17 -O3 \
   native/cuda/orbit_wars_v8_cuda_smoke.cpp \

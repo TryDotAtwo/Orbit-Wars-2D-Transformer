@@ -1,5 +1,6 @@
 #include "orbit_wars_v8_cuda.h"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <cmath>
@@ -30,6 +31,19 @@ constexpr int MAX_TOKEN_FLEETS = 640;
 constexpr int RESIDENT_TOKEN_COUNT = 1 + PLANETS + MAX_TOKEN_FLEETS;
 constexpr float LAYER_NORM_EPS = 1.0e-5f;
 constexpr float NEG_INF = -3.402823466e38f;
+
+cublasHandle_t g_cublas_handle = nullptr;
+
+cudaError_t ensure_cublas_handle() {
+  if (g_cublas_handle) {
+    return cudaSuccess;
+  }
+  cublasStatus_t status = cublasCreate(&g_cublas_handle);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorInitializationError;
+  }
+  return cudaSuccess;
+}
 
 OrbitWarsV8CudaStatus ok() {
   return {CUDA_STATUS_OK, "ok"};
@@ -314,6 +328,13 @@ __global__ void linear_kernel(
   output[index] = value;
 }
 
+__global__ void add_linear_bias_kernel(float* output, const float* bias, int rows, int out_features) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * out_features;
+  if (index >= total) return;
+  output[index] += bias[index % out_features];
+}
+
 __global__ void qkv_project_kernel(
     const float* input,
     const float* weight,
@@ -446,8 +467,29 @@ cudaError_t launch_linear(
     int rows,
     int in_features,
     int out_features) {
-  linear_kernel<<<blocks_for(rows * out_features), 256>>>(
-      input, weight, bias, output, rows, in_features, out_features);
+  cudaError_t error = ensure_cublas_handle();
+  if (error != cudaSuccess) return error;
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status = cublasSgemm(
+      g_cublas_handle,
+      CUBLAS_OP_T,
+      CUBLAS_OP_N,
+      out_features,
+      rows,
+      in_features,
+      &alpha,
+      weight,
+      in_features,
+      input,
+      in_features,
+      &beta,
+      output,
+      out_features);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorUnknown;
+  }
+  add_linear_bias_kernel<<<blocks_for(rows * out_features), 256>>>(output, bias, rows, out_features);
   return cudaGetLastError();
 }
 
@@ -458,9 +500,14 @@ cudaError_t launch_qkv(
     float* output,
     int rows,
     int offset) {
-  qkv_project_kernel<<<blocks_for(rows * D_MODEL), 256>>>(
-      input, weight, bias, output, rows, offset);
-  return cudaGetLastError();
+  return launch_linear(
+      input,
+      weight + static_cast<size_t>(offset) * D_MODEL,
+      bias + offset,
+      output,
+      rows,
+      D_MODEL,
+      D_MODEL);
 }
 
 cudaError_t run_attention_block(
