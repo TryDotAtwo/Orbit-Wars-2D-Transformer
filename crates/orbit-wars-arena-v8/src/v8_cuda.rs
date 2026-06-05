@@ -22,6 +22,7 @@ const SIM_READ_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read\0";
 const SIM_READ_PLANETS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_planets_stats\0";
 const SIM_READ_STATUS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_status_stats\0";
 const RESIDENT_MODEL_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_model_decode\0";
+const RESIDENT_MODELS_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_decode\0";
 const DEFAULT_CUDA_V8_LIBRARY_PATH: &str = "target/liborbit_wars_v8_cuda.so";
 const TOKEN_FEATURES: usize = 14;
 const ACTION_SLOTS: usize = 8;
@@ -341,6 +342,17 @@ type ResidentModelDecodeFn = unsafe extern "C" fn(
     request_count: usize,
     step: i32,
 ) -> OrbitWarsV8CudaStatus;
+type ResidentModelsDecodeFn = unsafe extern "C" fn(
+    models: *const *mut c_void,
+    model_count: usize,
+    state: *mut c_void,
+    request_offsets: *const i32,
+    request_counts: *const i32,
+    request_game_indices: *const i32,
+    request_player_ids: *const i32,
+    request_total: usize,
+    step: i32,
+) -> OrbitWarsV8CudaStatus;
 
 pub struct V8Cuda {
     library_handle: *mut c_void,
@@ -362,6 +374,7 @@ pub struct V8Cuda {
     sim_read_planets_stats_fn: SimReadPlanetsStatsFn,
     sim_read_status_stats_fn: SimReadStatusStatsFn,
     resident_model_decode_fn: ResidentModelDecodeFn,
+    resident_models_decode_fn: ResidentModelsDecodeFn,
 }
 
 impl V8Cuda {
@@ -462,6 +475,11 @@ impl V8Cuda {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_resident_model_decode_symbol_missing={}", dlerror_text()));
         }
+        let resident_models_decode_fn = unsafe { dlsym(handle, RESIDENT_MODELS_DECODE_SYMBOL.as_ptr() as *const c_char) };
+        if resident_models_decode_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_resident_models_decode_symbol_missing={}", dlerror_text()));
+        }
         Ok(Self {
             library_handle: handle,
             status_fn: unsafe { std::mem::transmute::<*mut c_void, V8StatusFn>(status_fn) },
@@ -481,6 +499,7 @@ impl V8Cuda {
             sim_read_planets_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadPlanetsStatsFn>(sim_read_planets_stats_fn) },
             sim_read_status_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadStatusStatsFn>(sim_read_status_stats_fn) },
             resident_model_decode_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelDecodeFn>(resident_model_decode_fn) },
+            resident_models_decode_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsDecodeFn>(resident_models_decode_fn) },
         })
     }
 
@@ -544,6 +563,48 @@ impl V8Cuda {
             cuda: self,
             pointer,
         })
+    }
+
+    pub fn resident_decode_many(
+        &self,
+        models: &[V8CudaModel<'_>],
+        sim_state: &CudaSimState<'_>,
+        request_offsets: &[i32],
+        request_counts: &[i32],
+        request_game_indices: &[i32],
+        request_player_ids: &[i32],
+        step: usize,
+    ) -> Result<(), String> {
+        if request_offsets.len() != models.len() || request_counts.len() != models.len() {
+            return Err(format!(
+                "resident_decode_many_model_len_mismatch=models:{} offsets:{} counts:{}",
+                models.len(),
+                request_offsets.len(),
+                request_counts.len()
+            ));
+        }
+        if request_game_indices.len() != request_player_ids.len() {
+            return Err(format!(
+                "resident_decode_many_request_len_mismatch={}!={}",
+                request_game_indices.len(),
+                request_player_ids.len()
+            ));
+        }
+        let model_pointers = models.iter().map(|model| model.pointer).collect::<Vec<_>>();
+        let status = unsafe {
+            (self.resident_models_decode_fn)(
+                model_pointers.as_ptr(),
+                model_pointers.len(),
+                sim_state.pointer,
+                request_offsets.as_ptr(),
+                request_counts.as_ptr(),
+                request_game_indices.as_ptr(),
+                request_player_ids.as_ptr(),
+                request_game_indices.len(),
+                step as i32,
+            )
+        };
+        require_ok(status, "cuda_resident_models_decode")
     }
 
     #[allow(dead_code)]

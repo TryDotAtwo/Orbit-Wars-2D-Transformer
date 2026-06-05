@@ -206,6 +206,17 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
     float* amount_logits,
     OrbitWarsV8CudaShape shape);
 
+OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* state,
+    const int* request_offsets,
+    const int* request_counts,
+    const int* request_game_indices,
+    const int* request_player_ids,
+    size_t request_total,
+    int step);
+
 #ifdef __cplusplus
 }
 #endif

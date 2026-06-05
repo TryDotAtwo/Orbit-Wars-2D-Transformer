@@ -2087,6 +2087,46 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
   return ok();
 }
 
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* opaque,
+    const int* request_offsets,
+    const int* request_counts,
+    const int* request_game_indices,
+    const int* request_player_ids,
+    size_t request_total,
+    int step) {
+  if (!models || !opaque || !request_offsets || !request_counts ||
+      !request_game_indices || !request_player_ids) {
+    return bad_argument("null resident models decode argument");
+  }
+  for (size_t model_index = 0; model_index < model_count; ++model_index) {
+    if (!models[model_index]) {
+      return bad_argument("null resident model entry");
+    }
+    const int offset = request_offsets[model_index];
+    const int count = request_counts[model_index];
+    if (offset < 0 || count < 0 || static_cast<size_t>(offset + count) > request_total) {
+      return bad_argument("resident models request range out of bounds");
+    }
+    if (count == 0) {
+      continue;
+    }
+    OrbitWarsV8CudaStatus status = orbit_wars_cuda_v8_resident_model_decode(
+        models[model_index],
+        opaque,
+        request_game_indices + offset,
+        request_player_ids + offset,
+        static_cast<size_t>(count),
+        step);
+    if (status.code != CUDA_STATUS_OK) {
+      return status;
+    }
+  }
+  return ok();
+}
+
 extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read(
     OrbitWarsCudaSimState* opaque,
     OrbitWarsCudaPlanet* planets,

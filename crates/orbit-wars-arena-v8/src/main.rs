@@ -725,6 +725,7 @@ fn run_cuda_model_game_batch(
                 &mut games,
                 &requests_by_model,
                 cuda_models,
+                cuda,
                 replay_stride,
                 player_count,
             )?;
@@ -1015,6 +1016,7 @@ fn step_active_model_games_gpu_resident(
     games: &mut [ActiveModelGame],
     requests_by_model: &[Vec<(usize, usize)>],
     cuda_models: &[v8_cuda::V8CudaModel<'_>],
+    cuda: &v8_cuda::V8Cuda,
     replay_stride: usize,
     player_count: usize,
 ) -> Result<bool, String> {
@@ -1043,12 +1045,12 @@ fn step_active_model_games_gpu_resident(
         }
     }
     group.sim_state.clear_actions()?;
-    for (model_id, requests) in requests_by_model.iter().enumerate() {
-        if requests.is_empty() {
-            continue;
-        }
-        let mut request_games = Vec::with_capacity(requests.len());
-        let mut request_players = Vec::with_capacity(requests.len());
+    let mut request_offsets = Vec::with_capacity(requests_by_model.len());
+    let mut request_counts = Vec::with_capacity(requests_by_model.len());
+    let mut request_games = Vec::new();
+    let mut request_players = Vec::new();
+    for requests in requests_by_model {
+        request_offsets.push(request_games.len() as i32);
         for &(game_index, player) in requests {
             let local_game = local_by_game
                 .get(game_index)
@@ -1060,7 +1062,18 @@ fn step_active_model_games_gpu_resident(
             request_games.push(local_game as i32);
             request_players.push(player as i32);
         }
-        cuda_models[model_id].resident_decode(&group.sim_state, &request_games, &request_players, step)?;
+        request_counts.push((request_games.len() as i32) - *request_offsets.last().unwrap());
+    }
+    if !request_games.is_empty() {
+        cuda.resident_decode_many(
+            cuda_models,
+            &group.sim_state,
+            &request_offsets,
+            &request_counts,
+            &request_games,
+            &request_players,
+            step,
+        )?;
     }
     group.sim_state.step_device_actions(step)?;
     group.step += 1;
