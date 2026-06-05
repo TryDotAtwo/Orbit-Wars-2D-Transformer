@@ -42,6 +42,10 @@ cudaError_t ensure_cublas_handle() {
   if (status != CUBLAS_STATUS_SUCCESS) {
     return cudaErrorInitializationError;
   }
+  status = cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    return cudaErrorInitializationError;
+  }
   return cudaSuccess;
 }
 
@@ -143,6 +147,7 @@ struct ForwardWorkspace {
   DeviceBuffer<float> token_q;
   DeviceBuffer<float> token_k;
   DeviceBuffer<float> token_v;
+  DeviceBuffer<float> token_qkv;
   DeviceBuffer<float> token_context;
   DeviceBuffer<float> token_ff_mid;
   DeviceBuffer<float> token_ff_out;
@@ -152,6 +157,7 @@ struct ForwardWorkspace {
   DeviceBuffer<float> slot_q;
   DeviceBuffer<float> slot_k;
   DeviceBuffer<float> slot_v;
+  DeviceBuffer<float> slot_qkv;
   DeviceBuffer<float> slot_context;
   DeviceBuffer<float> slot_ff_mid;
   DeviceBuffer<float> slot_ff_out;
@@ -357,6 +363,29 @@ __global__ void qkv_project_kernel(
   output[index] = value;
 }
 
+__global__ void split_qkv_kernel(const float* qkv, float* q, float* k, float* v, int rows) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D_MODEL;
+  if (index >= total) return;
+  int row = index / D_MODEL;
+  int dim = index % D_MODEL;
+  const float* source = qkv + row * D_MODEL * 3 + dim;
+  q[index] = source[0];
+  k[index] = source[D_MODEL];
+  v[index] = source[D_MODEL * 2];
+}
+
+__global__ void split_kv_kernel(const float* kv, float* k, float* v, int rows) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D_MODEL;
+  if (index >= total) return;
+  int row = index / D_MODEL;
+  int dim = index % D_MODEL;
+  const float* source = kv + row * D_MODEL * 2 + dim;
+  k[index] = source[0];
+  v[index] = source[D_MODEL];
+}
+
 __global__ void gelu_kernel(float* values, int count) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index < count) {
@@ -510,6 +539,42 @@ cudaError_t launch_qkv(
       D_MODEL);
 }
 
+cudaError_t launch_qkv_all(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* qkv,
+    float* q,
+    float* k,
+    float* v,
+    int rows) {
+  cudaError_t error = launch_linear(input, weight, bias, qkv, rows, D_MODEL, D_MODEL * 3);
+  if (error != cudaSuccess) return error;
+  split_qkv_kernel<<<blocks_for(rows * D_MODEL), 256>>>(qkv, q, k, v, rows);
+  return cudaGetLastError();
+}
+
+cudaError_t launch_kv_all(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* kv,
+    float* k,
+    float* v,
+    int rows) {
+  cudaError_t error = launch_linear(
+      input,
+      weight + static_cast<size_t>(D_MODEL) * D_MODEL,
+      bias + D_MODEL,
+      kv,
+      rows,
+      D_MODEL,
+      D_MODEL * 2);
+  if (error != cudaSuccess) return error;
+  split_kv_kernel<<<blocks_for(rows * D_MODEL), 256>>>(kv, k, v, rows);
+  return cudaGetLastError();
+}
+
 cudaError_t run_attention_block(
     const TensorMap& map,
     const char* prefix,
@@ -520,6 +585,7 @@ cudaError_t run_attention_block(
     DeviceBuffer<float>& q,
     DeviceBuffer<float>& k,
     DeviceBuffer<float>& v,
+    DeviceBuffer<float>& qkv,
     DeviceBuffer<float>& context,
     int batch_count,
     int query_count,
@@ -532,11 +598,14 @@ cudaError_t run_attention_block(
   if (!in_proj_weight || !in_proj_bias || !out_weight || !out_bias) {
     return cudaErrorInvalidSymbol;
   }
-  cudaError_t error = launch_qkv(query, in_proj_weight, in_proj_bias, q.ptr, batch_count * query_count, 0);
-  if (error != cudaSuccess) return error;
-  error = launch_qkv(key_value, in_proj_weight, in_proj_bias, k.ptr, batch_count * key_count, D_MODEL);
-  if (error != cudaSuccess) return error;
-  error = launch_qkv(key_value, in_proj_weight, in_proj_bias, v.ptr, batch_count * key_count, D_MODEL * 2);
+  cudaError_t error = cudaSuccess;
+  if (query == key_value && query_count == key_count) {
+    error = launch_qkv_all(query, in_proj_weight, in_proj_bias, qkv.ptr, q.ptr, k.ptr, v.ptr, batch_count * query_count);
+  } else {
+    error = launch_qkv(query, in_proj_weight, in_proj_bias, q.ptr, batch_count * query_count, 0);
+    if (error != cudaSuccess) return error;
+    error = launch_kv_all(key_value, in_proj_weight, in_proj_bias, qkv.ptr, k.ptr, v.ptr, batch_count * key_count);
+  }
   if (error != cudaSuccess) return error;
   attention_kernel<<<blocks_for(batch_count * query_count * HEADS), 256>>>(
       q.ptr, k.ptr, v.ptr, key_padding_mask, context.ptr, batch_count, query_count, key_count);
@@ -555,6 +624,7 @@ cudaError_t encoder_layer(
     DeviceBuffer<float>& q,
     DeviceBuffer<float>& k,
     DeviceBuffer<float>& v,
+    DeviceBuffer<float>& qkv,
     DeviceBuffer<float>& context,
     DeviceBuffer<float>& ff_mid,
     DeviceBuffer<float>& ff_out,
@@ -570,7 +640,7 @@ cudaError_t encoder_layer(
   if (error != cudaSuccess) return error;
   error = run_attention_block(
       map, (prefix + ".self_attn").c_str(), norm.ptr, norm.ptr, padding_mask, attn.ptr,
-      q, k, v, context, batch_count, token_count, token_count);
+      q, k, v, qkv, context, batch_count, token_count, token_count);
   if (error != cudaSuccess) return error;
   add_kernel<<<blocks_for(batch_count * token_count * D_MODEL), 256>>>(
       hidden, attn.ptr, batch_count * token_count * D_MODEL);
@@ -613,6 +683,7 @@ cudaError_t decoder_layer(
     DeviceBuffer<float>& q,
     DeviceBuffer<float>& k,
     DeviceBuffer<float>& v,
+    DeviceBuffer<float>& qkv,
     DeviceBuffer<float>& context,
     DeviceBuffer<float>& ff_mid,
     DeviceBuffer<float>& ff_out,
@@ -628,7 +699,7 @@ cudaError_t decoder_layer(
   if (error != cudaSuccess) return error;
   error = run_attention_block(
       map, (prefix + ".self_attn").c_str(), norm.ptr, norm.ptr, nullptr, attn.ptr,
-      q, k, v, context, batch_count, ACTION_SLOTS, ACTION_SLOTS);
+      q, k, v, qkv, context, batch_count, ACTION_SLOTS, ACTION_SLOTS);
   if (error != cudaSuccess) return error;
   add_kernel<<<blocks_for(batch_count * ACTION_SLOTS * D_MODEL), 256>>>(
       slots, attn.ptr, batch_count * ACTION_SLOTS * D_MODEL);
@@ -644,7 +715,7 @@ cudaError_t decoder_layer(
   if (error != cudaSuccess) return error;
   error = run_attention_block(
       map, (prefix + ".multihead_attn").c_str(), norm.ptr, memory, memory_padding_mask, attn.ptr,
-      q, k, v, context, batch_count, ACTION_SLOTS, token_count);
+      q, k, v, qkv, context, batch_count, ACTION_SLOTS, token_count);
   if (error != cudaSuccess) return error;
   add_kernel<<<blocks_for(batch_count * ACTION_SLOTS * D_MODEL), 256>>>(
       slots, attn.ptr, batch_count * ACTION_SLOTS * D_MODEL);
@@ -718,6 +789,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   DeviceBuffer<float>& token_q = workspace.token_q;
   DeviceBuffer<float>& token_k = workspace.token_k;
   DeviceBuffer<float>& token_v = workspace.token_v;
+  DeviceBuffer<float>& token_qkv = workspace.token_qkv;
   DeviceBuffer<float>& token_context = workspace.token_context;
   DeviceBuffer<float>& token_ff_mid = workspace.token_ff_mid;
   DeviceBuffer<float>& token_ff_out = workspace.token_ff_out;
@@ -727,6 +799,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   DeviceBuffer<float>& slot_q = workspace.slot_q;
   DeviceBuffer<float>& slot_k = workspace.slot_k;
   DeviceBuffer<float>& slot_v = workspace.slot_v;
+  DeviceBuffer<float>& slot_qkv = workspace.slot_qkv;
   DeviceBuffer<float>& slot_context = workspace.slot_context;
   DeviceBuffer<float>& slot_ff_mid = workspace.slot_ff_mid;
   DeviceBuffer<float>& slot_ff_out = workspace.slot_ff_out;
@@ -749,6 +822,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   ENSURE(token_q, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(token_k, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(token_v, static_cast<size_t>(token_rows) * D_MODEL);
+  ENSURE(token_qkv, static_cast<size_t>(token_rows) * D_MODEL * 3);
   ENSURE(token_context, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(token_ff_mid, static_cast<size_t>(token_rows) * FF_DIM);
   ENSURE(token_ff_out, static_cast<size_t>(token_rows) * D_MODEL);
@@ -758,6 +832,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   ENSURE(slot_q, static_cast<size_t>(slot_rows) * D_MODEL);
   ENSURE(slot_k, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
   ENSURE(slot_v, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
+  ENSURE(slot_qkv, static_cast<size_t>(std::max(token_rows * 2, slot_rows * 3)) * D_MODEL);
   ENSURE(slot_context, static_cast<size_t>(slot_rows) * D_MODEL);
   ENSURE(slot_ff_mid, static_cast<size_t>(slot_rows) * FF_DIM);
   ENSURE(slot_ff_out, static_cast<size_t>(slot_rows) * D_MODEL);
@@ -789,7 +864,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   for (int layer = 0; layer < ENCODER_LAYERS; ++layer) {
     error = encoder_layer(
         tensor_map, layer, hidden.ptr, d_padding_mask.ptr, norm_token, token_attn,
-        token_q, token_k, token_v, token_context, token_ff_mid, token_ff_out,
+        token_q, token_k, token_v, token_qkv, token_context, token_ff_mid, token_ff_out,
         batch_count, token_count);
     if (error != cudaSuccess) return cuda_error(error);
   }
@@ -802,7 +877,7 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
   for (int layer = 0; layer < DECODER_LAYERS; ++layer) {
     error = decoder_layer(
         tensor_map, layer, slots.ptr, hidden.ptr, d_padding_mask.ptr, norm_slot, slot_attn,
-        slot_q, slot_k, slot_v, slot_context, slot_ff_mid, slot_ff_out,
+        slot_q, slot_k, slot_v, slot_qkv, slot_context, slot_ff_mid, slot_ff_out,
         batch_count, token_count);
     if (error != cudaSuccess) return cuda_error(error);
   }
@@ -878,6 +953,7 @@ OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
   ENSURE(workspace.token_q, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(workspace.token_k, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(workspace.token_v, static_cast<size_t>(token_rows) * D_MODEL);
+  ENSURE(workspace.token_qkv, static_cast<size_t>(token_rows) * D_MODEL * 3);
   ENSURE(workspace.token_context, static_cast<size_t>(token_rows) * D_MODEL);
   ENSURE(workspace.token_ff_mid, static_cast<size_t>(token_rows) * FF_DIM);
   ENSURE(workspace.token_ff_out, static_cast<size_t>(token_rows) * D_MODEL);
@@ -887,6 +963,7 @@ OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
   ENSURE(workspace.slot_q, static_cast<size_t>(slot_rows) * D_MODEL);
   ENSURE(workspace.slot_k, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
   ENSURE(workspace.slot_v, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
+  ENSURE(workspace.slot_qkv, static_cast<size_t>(std::max(token_rows * 2, slot_rows * 3)) * D_MODEL);
   ENSURE(workspace.slot_context, static_cast<size_t>(slot_rows) * D_MODEL);
   ENSURE(workspace.slot_ff_mid, static_cast<size_t>(slot_rows) * FF_DIM);
   ENSURE(workspace.slot_ff_out, static_cast<size_t>(slot_rows) * D_MODEL);
@@ -920,6 +997,7 @@ OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
         workspace.token_q,
         workspace.token_k,
         workspace.token_v,
+        workspace.token_qkv,
         workspace.token_context,
         workspace.token_ff_mid,
         workspace.token_ff_out,
@@ -942,6 +1020,7 @@ OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
         workspace.slot_q,
         workspace.slot_k,
         workspace.slot_v,
+        workspace.slot_qkv,
         workspace.slot_context,
         workspace.slot_ff_mid,
         workspace.slot_ff_out,
@@ -2356,6 +2435,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   DeviceBuffer<float> token_q;
   DeviceBuffer<float> token_k;
   DeviceBuffer<float> token_v;
+  DeviceBuffer<float> token_qkv;
   DeviceBuffer<float> token_context;
   DeviceBuffer<float> token_ff_mid;
   DeviceBuffer<float> token_ff_out;
@@ -2365,6 +2445,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   DeviceBuffer<float> slot_q;
   DeviceBuffer<float> slot_k;
   DeviceBuffer<float> slot_v;
+  DeviceBuffer<float> slot_qkv;
   DeviceBuffer<float> slot_context;
   DeviceBuffer<float> slot_ff_mid;
   DeviceBuffer<float> slot_ff_out;
@@ -2387,6 +2468,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   ALLOC(token_q, static_cast<size_t>(token_rows) * D_MODEL);
   ALLOC(token_k, static_cast<size_t>(token_rows) * D_MODEL);
   ALLOC(token_v, static_cast<size_t>(token_rows) * D_MODEL);
+  ALLOC(token_qkv, static_cast<size_t>(token_rows) * D_MODEL * 3);
   ALLOC(token_context, static_cast<size_t>(token_rows) * D_MODEL);
   ALLOC(token_ff_mid, static_cast<size_t>(token_rows) * FF_DIM);
   ALLOC(token_ff_out, static_cast<size_t>(token_rows) * D_MODEL);
@@ -2396,6 +2478,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   ALLOC(slot_q, static_cast<size_t>(slot_rows) * D_MODEL);
   ALLOC(slot_k, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
   ALLOC(slot_v, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
+  ALLOC(slot_qkv, static_cast<size_t>(std::max(token_rows * 2, slot_rows * 3)) * D_MODEL);
   ALLOC(slot_context, static_cast<size_t>(slot_rows) * D_MODEL);
   ALLOC(slot_ff_mid, static_cast<size_t>(slot_rows) * FF_DIM);
   ALLOC(slot_ff_out, static_cast<size_t>(slot_rows) * D_MODEL);
@@ -2427,7 +2510,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   for (int layer = 0; layer < ENCODER_LAYERS; ++layer) {
     error = encoder_layer(
         tensor_map, layer, hidden.ptr, d_padding_mask.ptr, norm_token, token_attn,
-        token_q, token_k, token_v, token_context, token_ff_mid, token_ff_out,
+        token_q, token_k, token_v, token_qkv, token_context, token_ff_mid, token_ff_out,
         batch_count, token_count);
     if (error != cudaSuccess) return cuda_error(error);
   }
@@ -2440,7 +2523,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_forward(
   for (int layer = 0; layer < DECODER_LAYERS; ++layer) {
     error = decoder_layer(
         tensor_map, layer, slots.ptr, hidden.ptr, d_padding_mask.ptr, norm_slot, slot_attn,
-        slot_q, slot_k, slot_v, slot_context, slot_ff_mid, slot_ff_out,
+        slot_q, slot_k, slot_v, slot_qkv, slot_context, slot_ff_mid, slot_ff_out,
         batch_count, token_count);
     if (error != cudaSuccess) return cuda_error(error);
   }

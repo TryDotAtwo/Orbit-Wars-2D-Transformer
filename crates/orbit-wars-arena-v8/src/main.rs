@@ -18,6 +18,7 @@ const PLAYER_COUNT_FOUR: usize = 4;
 const PLAYER_IDS: [i32; PLAYER_COUNT_FOUR] = [0, 1, 2, 3];
 const GPU_SIM_PLANETS: usize = 64;
 const GPU_RESIDENT_STATUS_POLL_STRIDE: usize = 16;
+const REPLAY_GAMES_PER_GENERATION: usize = 4;
 const MAP_SEED_BASE: u64 = 0x4f_57_4d_41_50;
 const MAP_GENERATION_SEED_FACTOR: u64 = 1_000_003;
 const MAP_GAME_SEED_FACTOR: u64 = 9_176;
@@ -2030,10 +2031,16 @@ fn write_dashboard_telemetry(
         fs::create_dir_all(parent).map_err(|error| format!("telemetry_dir_failed={error}"))?;
     }
     let games = results.len().max(1);
+    let replay_game_count = results.len().min(REPLAY_GAMES_PER_GENERATION);
     let win_count = results.iter().filter(|result| result.winner == Some(0)).count();
     let draw_count = results.iter().filter(|result| result.winner.is_none()).count();
     let win_rate = win_count as f32 / games as f32;
-    let latest_frames = results.last().map(|result| result.frames.as_slice()).unwrap_or(&[]);
+    let latest_frames = results
+        .iter()
+        .take(replay_game_count.max(1))
+        .last()
+        .map(|result| result.frames.as_slice())
+        .unwrap_or(&[]);
     let stats_count = results
         .iter()
         .map(|result| result.player_stats.len())
@@ -2097,7 +2104,7 @@ fn write_dashboard_telemetry(
             "  \"eliteCount\":1,\n",
             "  \"gamesPerModel\":{},\n",
             "  \"replaysPerModel\":1,\n",
-            "  \"generationReplayGameCount\":1,\n",
+            "  \"generationReplayGameCount\":{},\n",
             "  \"playersPerGame\":{},\n",
             "  \"simultaneousGames\":1,\n",
             "  \"inferenceBatchCalls\":{},\n",
@@ -2106,7 +2113,7 @@ fn write_dashboard_telemetry(
             "  \"turnLoop\":\"orbit_wars_core_step_turn_with_events\",\n",
             "  \"fullReplay\":{},\n",
             "  \"replayFrameStride\":{},\n",
-            "  \"storedReplayGames\":1,\n",
+            "  \"storedReplayGames\":{},\n",
             "  \"gamesPerSecond\":{:.3},\n",
             "  \"turnsPerSecond\":{:.3},\n",
             "  \"gpuUtilization\":0,\n",
@@ -2120,7 +2127,7 @@ fn write_dashboard_telemetry(
             "  \"models\":[{}],\n",
             "  \"frames\":[{}],\n",
             "  \"replayChunks\":[],\n",
-            "  \"replayGames\":[{{\"generation\":1,\"modelId\":\"V8-Arena\",\"gameIndex\":{},\"opponentId\":\"{}\",\"reward\":0,\"frames\":[{}]}}]\n",
+            "  \"replayGames\":[{}]\n",
             "}}\n"
         ),
         source_message,
@@ -2128,20 +2135,20 @@ fn write_dashboard_telemetry(
         config.episode_steps + 1,
             stats_count,
         games_per_model_report,
+        replay_game_count,
         player_count,
         model_action_calls,
         max_inference_batch_size,
         if replay_stride == 1 { "true" } else { "false" },
         replay_stride,
+        replay_game_count,
         games as f32 / elapsed,
         turns as f32 / elapsed,
-        metric_json(1, win_rate, games, model_action_calls, max_inference_batch_size, launch_actions, launched_ships, captures, fleet_hits, hit_ships, sun_fleets, sun_ships, elapsed),
+        metric_json(1, win_rate, games, replay_game_count, model_action_calls, max_inference_batch_size, launch_actions, launched_ships, captures, fleet_hits, hit_ships, sun_fleets, sun_ships, elapsed),
         generation_win_rate_json(1, games, win_count, draw_count, games.saturating_sub(win_count + draw_count), win_rate),
         models_json(&player_stats, model_mode),
         frames_json(latest_frames),
-        games.saturating_sub(1),
-        model_mode,
-        frames_json(latest_frames)
+        replay_games_json(results, model_mode, replay_game_count)
     );
     fs::write(path, json).map_err(|error| format!("telemetry_write_failed={error}"))
 }
@@ -2150,6 +2157,7 @@ fn metric_json(
     generation: usize,
     win_rate: f32,
     games: usize,
+    sampled_replay_games: usize,
     model_action_calls: usize,
     max_inference_batch_size: usize,
     launch_actions: usize,
@@ -2162,8 +2170,8 @@ fn metric_json(
     elapsed: f32,
 ) -> String {
     format!(
-        "{{\"generation\":{},\"winRate\":{:.6},\"gamesPerSecond\":{:.3},\"turnsPerSecond\":0.0,\"p95LatencyMs\":0.0,\"gpuUtilization\":0,\"evaluatedGames\":{},\"sampledReplayGames\":1,\"modelActionCalls\":{},\"launchActions\":{},\"launchedShips\":{},\"captures\":{},\"fleetHits\":{},\"hitShips\":{},\"sunDestroyedFleets\":{},\"sunDestroyedShips\":{},\"avgFleetSize\":0.0,\"avgLaunchActionsPerTurn\":0.0,\"avgLaunchedShipsPerTurn\":0.0,\"avgModelActionMs\":0.0,\"inferenceBatchCalls\":{},\"maxInferenceBatchSize\":{},\"simultaneousGames\":1,\"modelActionSeconds\":0.0,\"simulationStepSeconds\":{:.6},\"evaluationSeconds\":{:.6},\"replaySeconds\":0.0,\"replayWriteSeconds\":0.0,\"generationValidationGames\":0,\"generationValidationSeconds\":0.0,\"backpropSamples\":0,\"backpropModels\":0,\"backpropSeconds\":0.0,\"reproductionSeconds\":0.0,\"generationSeconds\":{:.6}}}",
-        generation, win_rate, games as f32 / elapsed, games, model_action_calls, launch_actions, launched_ships, captures, fleet_hits, hit_ships, sun_fleets, sun_ships, model_action_calls, max_inference_batch_size, elapsed, elapsed, elapsed
+        "{{\"generation\":{},\"winRate\":{:.6},\"gamesPerSecond\":{:.3},\"turnsPerSecond\":0.0,\"p95LatencyMs\":0.0,\"gpuUtilization\":0,\"evaluatedGames\":{},\"sampledReplayGames\":{},\"modelActionCalls\":{},\"launchActions\":{},\"launchedShips\":{},\"captures\":{},\"fleetHits\":{},\"hitShips\":{},\"sunDestroyedFleets\":{},\"sunDestroyedShips\":{},\"avgFleetSize\":0.0,\"avgLaunchActionsPerTurn\":0.0,\"avgLaunchedShipsPerTurn\":0.0,\"avgModelActionMs\":0.0,\"inferenceBatchCalls\":{},\"maxInferenceBatchSize\":{},\"simultaneousGames\":1,\"modelActionSeconds\":0.0,\"simulationStepSeconds\":{:.6},\"evaluationSeconds\":{:.6},\"replaySeconds\":0.0,\"replayWriteSeconds\":0.0,\"generationValidationGames\":0,\"generationValidationSeconds\":0.0,\"backpropSamples\":0,\"backpropModels\":0,\"backpropSeconds\":0.0,\"reproductionSeconds\":0.0,\"generationSeconds\":{:.6}}}",
+        generation, win_rate, games as f32 / elapsed, games, sampled_replay_games, model_action_calls, launch_actions, launched_ships, captures, fleet_hits, hit_ships, sun_fleets, sun_ships, model_action_calls, max_inference_batch_size, elapsed, elapsed, elapsed
     )
 }
 
@@ -2172,6 +2180,31 @@ fn generation_win_rate_json(generation: usize, games: usize, wins: usize, draws:
         "{{\"validationGeneration\":{},\"evaluatedGeneration\":{},\"modelCount\":1,\"games\":{},\"wins\":{},\"draws\":{},\"losses\":{},\"winRate\":{:.6}}}",
         generation, generation, games, wins, draws, losses, win_rate
     )
+}
+
+fn replay_games_json(results: &[GameResult], model_mode: &str, replay_game_count: usize) -> String {
+    results
+        .iter()
+        .take(replay_game_count)
+        .enumerate()
+        .map(|(game_index, result)| {
+            let reward = if result.winner == Some(0) {
+                1
+            } else if result.winner.is_none() {
+                0
+            } else {
+                -1
+            };
+            format!(
+                "{{\"generation\":1,\"modelId\":\"V8-Arena\",\"gameIndex\":{},\"opponentId\":\"{}\",\"reward\":{},\"frames\":[{}]}}",
+                game_index,
+                model_mode,
+                reward,
+                frames_json(&result.frames)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn models_json(stats: &[PlayerStats], parent: &str) -> String {
