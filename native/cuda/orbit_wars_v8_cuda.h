@@ -80,6 +80,11 @@ typedef struct OrbitWarsV8CudaDeviceBatchView {
   unsigned char* padding_mask;
   unsigned char* planet_mask;
   OrbitWarsCudaActionLabel* labels;
+  int* labels_fire;
+  int* labels_source;
+  int* labels_target;
+  int* labels_amount;
+  float* labels_confidence;
   size_t request_count;
   size_t token_count;
   size_t token_features;

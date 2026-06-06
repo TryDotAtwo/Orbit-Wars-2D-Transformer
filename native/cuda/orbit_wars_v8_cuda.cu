@@ -274,6 +274,11 @@ struct ForwardWorkspace {
   DeviceBuffer<int> request_game_indices;
   DeviceBuffer<int> request_player_ids;
   DeviceBuffer<OrbitWarsCudaActionLabel> d_action_labels;
+  DeviceBuffer<int> d_labels_fire;
+  DeviceBuffer<int> d_labels_source;
+  DeviceBuffer<int> d_labels_target;
+  DeviceBuffer<int> d_labels_amount;
+  DeviceBuffer<float> d_labels_confidence;
   size_t last_request_count = 0;
   size_t last_token_count = RESIDENT_TOKEN_COUNT;
 };
@@ -1958,7 +1963,12 @@ __global__ void resident_decode_actions_kernel(
     const float* source_logits,
     const float* target_logits,
     const float* amount_logits,
-    OrbitWarsCudaActionLabel* labels) {
+    OrbitWarsCudaActionLabel* labels,
+    int* labels_fire,
+    int* labels_source,
+    int* labels_target,
+    int* labels_amount,
+    float* labels_confidence) {
   const int request = blockIdx.x * blockDim.x + threadIdx.x;
   if (request >= request_count) return;
   const int game = request_game_indices[request];
@@ -1969,6 +1979,12 @@ __global__ void resident_decode_actions_kernel(
   *action_count = 0;
   OrbitWarsCudaActionLabel label{};
   for (int index = 0; index < ACTION_SLOTS; ++index) {
+    const int dense = request * ACTION_SLOTS + index;
+    if (labels_fire) labels_fire[dense] = 0;
+    if (labels_source) labels_source[dense] = -1;
+    if (labels_target) labels_target[dense] = -1;
+    if (labels_amount) labels_amount[dense] = -1;
+    if (labels_confidence) labels_confidence[dense] = 0.0f;
     label.source_row[index] = -1;
     label.target_row[index] = -1;
     label.amount_class[index] = -1;
@@ -2013,6 +2029,12 @@ __global__ void resident_decode_actions_kernel(
     if (amount_index < 0) continue;
     const int ships = resident_amount_ships(amount_index, source.ships);
     if (ships < 1) continue;
+    const int dense = request * ACTION_SLOTS + best_slot;
+    if (labels_fire) labels_fire[dense] = 1;
+    if (labels_source) labels_source[dense] = source_row;
+    if (labels_target) labels_target[dense] = target_row;
+    if (labels_amount) labels_amount[dense] = amount_index;
+    if (labels_confidence) labels_confidence[dense] = best_fire;
     label.fire[written] = 1;
     label.source_row[written] = source_row;
     label.target_row[written] = target_row;
@@ -2951,6 +2973,11 @@ OrbitWarsV8CudaStatus resident_model_decode_device(
   ENSURE(workspace.d_padding_mask, request_count * RESIDENT_TOKEN_COUNT);
   ENSURE(workspace.d_planet_mask, request_count * PLANETS);
   ENSURE(workspace.d_action_labels, request_count);
+  ENSURE(workspace.d_labels_fire, request_count * ACTION_SLOTS);
+  ENSURE(workspace.d_labels_source, request_count * ACTION_SLOTS);
+  ENSURE(workspace.d_labels_target, request_count * ACTION_SLOTS);
+  ENSURE(workspace.d_labels_amount, request_count * ACTION_SLOTS);
+  ENSURE(workspace.d_labels_confidence, request_count * ACTION_SLOTS);
 #undef ENSURE
   workspace.last_request_count = request_count;
   CudaSimKernelState kernel_state = sim_kernel_state(sim_state);
@@ -2992,7 +3019,12 @@ OrbitWarsV8CudaStatus resident_model_decode_device(
       workspace.d_source.ptr,
       workspace.d_target.ptr,
       workspace.d_amount.ptr,
-      workspace.d_action_labels.ptr);
+      workspace.d_action_labels.ptr,
+      workspace.d_labels_fire.ptr,
+      workspace.d_labels_source.ptr,
+      workspace.d_labels_target.ptr,
+      workspace.d_labels_amount.ptr,
+      workspace.d_labels_confidence.ptr);
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
@@ -3117,6 +3149,11 @@ OrbitWarsV8CudaStatus resident_models_decode_plan_impl(
     ENSURE_RESIDENT(workspace.d_padding_mask, static_cast<size_t>(count) * RESIDENT_TOKEN_COUNT);
     ENSURE_RESIDENT(workspace.d_planet_mask, static_cast<size_t>(count) * PLANETS);
     ENSURE_RESIDENT(workspace.d_action_labels, static_cast<size_t>(count));
+    ENSURE_RESIDENT(workspace.d_labels_fire, static_cast<size_t>(count) * ACTION_SLOTS);
+    ENSURE_RESIDENT(workspace.d_labels_source, static_cast<size_t>(count) * ACTION_SLOTS);
+    ENSURE_RESIDENT(workspace.d_labels_target, static_cast<size_t>(count) * ACTION_SLOTS);
+    ENSURE_RESIDENT(workspace.d_labels_amount, static_cast<size_t>(count) * ACTION_SLOTS);
+    ENSURE_RESIDENT(workspace.d_labels_confidence, static_cast<size_t>(count) * ACTION_SLOTS);
 #undef ENSURE_RESIDENT
     workspace.last_request_count = static_cast<size_t>(count);
     workspace.last_token_count = static_cast<size_t>(resident_token_count);
@@ -3316,7 +3353,12 @@ OrbitWarsV8CudaStatus resident_models_decode_plan_impl(
         workspace.d_source.ptr,
         workspace.d_target.ptr,
         workspace.d_amount.ptr,
-        workspace.d_action_labels.ptr);
+        workspace.d_action_labels.ptr,
+        workspace.d_labels_fire.ptr,
+        workspace.d_labels_source.ptr,
+        workspace.d_labels_target.ptr,
+        workspace.d_labels_amount.ptr,
+        workspace.d_labels_confidence.ptr);
     error = cudaGetLastError();
     if (error != cudaSuccess) return cuda_error(error);
   }
@@ -3458,6 +3500,11 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_last_batch_device_view(
       workspace.d_padding_mask.ptr,
       workspace.d_planet_mask.ptr,
       workspace.d_action_labels.ptr,
+      workspace.d_labels_fire.ptr,
+      workspace.d_labels_source.ptr,
+      workspace.d_labels_target.ptr,
+      workspace.d_labels_amount.ptr,
+      workspace.d_labels_confidence.ptr,
       request_count,
       token_count,
       TOKEN_FEATURES,
