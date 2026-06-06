@@ -82,7 +82,10 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
     if not nvidia_root.exists():
         continue
     for include in nvidia_root.rglob("include"):
-        if (include / "cuda_runtime.h").exists() and include not in seen_includes:
+        if (
+            (include / "cuda_runtime.h").exists()
+            or (include / "nv" / "target").exists()
+        ) and include not in seen_includes:
             include_flags.append(f"-I{include}")
             seen_includes.add(include)
     for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):

@@ -1,3 +1,4 @@
 numpy>=1.26
 torch>=2.8,<2.13
 cuda-toolkit[nvcc]>=13.0
+cuda-cccl[cu13]>=3.0
