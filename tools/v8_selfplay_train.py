@@ -65,6 +65,13 @@ class SelfPlayConfig:
         game_count = max(1, self.population * self.games_per_candidate // max(1, self.players))
         return game_count * self.players * sampled_steps
 
+    def single_rl_training_trace_capacity(self) -> int:
+        if self.max_selfplay_samples is not None and self.max_selfplay_samples > 0:
+            return self.max_selfplay_samples
+        step_count = self.arena_step_limit or 500
+        sampled_steps = max(1, math.ceil(step_count / max(1, self.training_trace_stride)))
+        return max(1, self.games_per_candidate) * max(1, self.players) * sampled_steps
+
 
 @dataclass(frozen=True)
 class CandidateResult:
@@ -119,6 +126,7 @@ def main() -> None:
     parser.add_argument("--dashboard-telemetry", type=Path, default=Path("dashboard/public/telemetry/latest.json"))
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--rl-single-model", action="store_true", help="Train one model from self-play outcomes only; no GA, no mutations.")
     args = parser.parse_args()
     if not args.base_checkpoint and not args.base_model_bin:
         parser.error("one of --base-checkpoint or --base-model-bin is required")
@@ -141,19 +149,34 @@ def main() -> None:
         target_loss_weight=args.target_loss_weight,
         replay_stride=args.replay_stride,
     )
-    run_selfplay(
-        base_checkpoint=args.base_checkpoint,
-        base_model_bin=args.base_model_bin,
-        run_dir=args.run_dir,
-        arena_bin=args.arena_bin,
-        arena_backend=args.arena_backend,
-        arena_prefix=arena_command_prefix(args),
-        arena_workers=args.arena_workers,
-        arena_cpu_workers=args.arena_cpu_workers,
-        config=config,
-        dashboard_telemetry=None if args.no_dashboard else args.dashboard_telemetry,
-        device=args.device,
-    )
+    if args.rl_single_model:
+        run_single_model_rl(
+            base_checkpoint=args.base_checkpoint,
+            base_model_bin=args.base_model_bin,
+            run_dir=args.run_dir,
+            arena_bin=args.arena_bin,
+            arena_backend=args.arena_backend,
+            arena_prefix=arena_command_prefix(args),
+            arena_workers=args.arena_workers,
+            arena_cpu_workers=args.arena_cpu_workers,
+            config=config,
+            dashboard_telemetry=None if args.no_dashboard else args.dashboard_telemetry,
+            device=args.device,
+        )
+    else:
+        run_selfplay(
+            base_checkpoint=args.base_checkpoint,
+            base_model_bin=args.base_model_bin,
+            run_dir=args.run_dir,
+            arena_bin=args.arena_bin,
+            arena_backend=args.arena_backend,
+            arena_prefix=arena_command_prefix(args),
+            arena_workers=args.arena_workers,
+            arena_cpu_workers=args.arena_cpu_workers,
+            config=config,
+            dashboard_telemetry=None if args.no_dashboard else args.dashboard_telemetry,
+            device=args.device,
+        )
 
 
 def arena_command_prefix(args: argparse.Namespace) -> list[str]:
@@ -352,6 +375,139 @@ def run_selfplay(
     return run_dir / "checkpoint.pt"
 
 
+def run_single_model_rl(
+    base_checkpoint: Path | None,
+    base_model_bin: Path | None,
+    run_dir: Path,
+    *,
+    arena_bin: Path,
+    arena_backend: str,
+    arena_prefix: list[str],
+    arena_workers: int,
+    arena_cpu_workers: int,
+    config: SelfPlayConfig,
+    dashboard_telemetry: Path | None,
+    device: str | None,
+) -> Path:
+    if arena_backend != "rust-cuda-population":
+        raise ValueError("--rl-single-model currently requires --arena-backend=rust-cuda-population")
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    model_config, current_state, optimizer_state, base_source = load_base_weights(base_checkpoint, base_model_bin)
+    history: list[CandidateResult] = []
+    trace_capacity = config.single_rl_training_trace_capacity()
+    print(json.dumps({
+        "event": "single_rl_start",
+        "base_source": base_source,
+        "run_dir": str(run_dir),
+        "arena_bin": str(arena_bin),
+        "arena_backend": arena_backend,
+        "arena_prefix": arena_prefix,
+        "arena_workers": arena_workers,
+        "arena_cpu_workers": arena_cpu_workers,
+        "device": device,
+        "reward": {"win": 1.0, "loss": -1.0, "draw": -1.0},
+        "config": asdict(config),
+        "arena_games_per_generation": config.games_per_candidate,
+        "training_trace_capacity": trace_capacity,
+    }), flush=True)
+
+    for generation in range(1, config.generations + 1):
+        generation_dir = run_dir / f"generation-{generation:04d}"
+        generation_dir.mkdir(parents=True, exist_ok=True)
+        candidates = make_single_model_players(current_state, model_config, generation_dir, generation, config.players)
+        telemetry_path = generation_dir / f"generation-{generation:04d}.single_rl.telemetry.json"
+        training_trace_path = generation_dir / f"generation-{generation:04d}.single_rl.training_trace.jsonl"
+        effective_arena_workers = arena_workers
+        if effective_arena_workers <= 0:
+            effective_arena_workers = max(1, config.games_per_candidate)
+        started = time.perf_counter()
+        run_population_arena(
+            arena_bin,
+            arena_prefix=arena_prefix,
+            candidates=candidates,
+            generation_dir=generation_dir,
+            telemetry_path=telemetry_path,
+            games_per_model=config.games_per_candidate,
+            players=config.players,
+            replay_stride=config.replay_stride,
+            step_limit=config.arena_step_limit,
+            workers=effective_arena_workers,
+            cpu_workers=arena_cpu_workers,
+            gpu_sim=config.arena_gpu_sim,
+            training_trace_path=training_trace_path,
+            training_trace_capacity=trace_capacity,
+            training_trace_stride=config.training_trace_stride,
+        )
+        arena_seconds = time.perf_counter() - started
+        telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
+        selfplay_samples = samples_from_training_trace(training_trace_path)
+        aggregate = single_rl_candidate_result(
+            generation,
+            telemetry_path,
+            telemetry,
+            len(selfplay_samples),
+        )
+        history.append(aggregate)
+        print(json.dumps({
+            "event": "single_rl_arena_complete",
+            "generation": generation,
+            "games": config.games_per_candidate,
+            "players": config.players,
+            "seconds": round(arena_seconds, 3),
+            "games_per_second": round(config.games_per_candidate / max(1.0e-9, arena_seconds), 3),
+            "samples": len(selfplay_samples),
+            "result": asdict(aggregate),
+        }, ensure_ascii=False), flush=True)
+
+        if selfplay_samples:
+            current_state, optimizer_state, backprop_metrics = backprop_on_selfplay(
+                current_state,
+                optimizer_state,
+                model_config,
+                selfplay_samples,
+                config,
+                device,
+            )
+        else:
+            backprop_metrics = {"samples": 0, "loss": 0.0}
+        backprop_metrics["arena_seconds"] = float(arena_seconds)
+        backprop_metrics["arena_games_per_second"] = config.games_per_candidate / max(1.0e-9, arena_seconds)
+
+        checkpoint_path = save_generation_checkpoint(
+            run_dir,
+            generation,
+            current_state,
+            optimizer_state,
+            model_config,
+            config,
+            aggregate,
+            backprop_metrics,
+        )
+        export_champion(run_dir, current_state, model_config)
+        write_history(run_dir, history, generation, aggregate, backprop_metrics, config)
+        if dashboard_telemetry:
+            dashboard_telemetry.parent.mkdir(parents=True, exist_ok=True)
+            write_dashboard_summary(
+                dashboard_telemetry,
+                run_dir=run_dir,
+                history=history,
+                generation=generation,
+                winner=aggregate,
+                backprop_metrics=backprop_metrics,
+                config=config,
+            )
+        print(json.dumps({
+            "event": "single_rl_generation_complete",
+            "generation": generation,
+            "checkpoint": str(checkpoint_path),
+            "model_bin": str(run_dir / "model.bin"),
+            "backprop": backprop_metrics,
+            "result": asdict(aggregate),
+        }, ensure_ascii=False), flush=True)
+    return run_dir / "checkpoint.pt"
+
+
 def load_base_weights(
     base_checkpoint: Path | None,
     base_model_bin: Path | None,
@@ -418,6 +574,30 @@ def make_population(
             })
             index += 1
         mutation_round += 1
+    return candidates
+
+
+def make_single_model_players(
+    state: dict[str, torch.Tensor],
+    model_config: V8ModelConfig,
+    generation_dir: Path,
+    generation: int,
+    players: int,
+) -> list[dict[str, Any]]:
+    candidates = []
+    player_count = max(1, players)
+    for index in range(player_count):
+        model_bin = generation_dir / f"single-player-{index:03d}.bin"
+        player_state = clone_state(state)
+        export_state_dict(player_state, model_config, model_bin)
+        candidates.append({
+            "id": f"g{generation:04d}-self-{index:03d}",
+            "parent": "single_model",
+            "role": "self_copy",
+            "mutation_std": 0.0,
+            "model_bin": str(model_bin),
+            "state": player_state,
+        })
     return candidates
 
 
@@ -695,6 +875,45 @@ def candidate_result_from_model_row(
         role=str(candidate["role"]),
         mutation_std=float(candidate["mutation_std"]),
         model_bin=str(candidate["model_bin"]),
+        telemetry=str(telemetry_path),
+        score=float(score),
+        win_rate=float(win_rate),
+        wins=wins,
+        draws=draws,
+        losses=losses,
+        launch_actions=launch_actions,
+        captures=captures,
+        fleet_hits=fleet_hits,
+        sun_destroyed_fleets=sun,
+        selfplay_samples=sample_count,
+    )
+
+
+def single_rl_candidate_result(
+    generation: int,
+    telemetry_path: Path,
+    telemetry: dict[str, Any],
+    sample_count: int,
+) -> CandidateResult:
+    models = telemetry.get("models") or []
+    wins = sum(int(model.get("wins", 0)) for model in models)
+    draws = sum(int(model.get("draws", 0)) for model in models)
+    losses = sum(int(model.get("losses", 0)) for model in models)
+    games = max(1, wins + draws + losses)
+    captures = sum(int(model.get("captures", 0)) for model in models)
+    fleet_hits = sum(int(model.get("fleetHits", 0)) for model in models)
+    launch_actions = sum(int(model.get("launchActions", 0)) for model in models)
+    sun = sum(int(model.get("sunDestroyedFleets", 0)) for model in models)
+    win_rate = wins / games
+    # Selection is irrelevant in single-RL, but score remains useful in history/dashboard.
+    score = (wins - losses - draws) / games
+    return CandidateResult(
+        generation=generation,
+        candidate_id=f"single-rl-g{generation:04d}",
+        parent_id="single_model",
+        role="single_rl",
+        mutation_std=0.0,
+        model_bin=str(telemetry_path.parent / "single-player-000.bin"),
         telemetry=str(telemetry_path),
         score=float(score),
         win_rate=float(win_rate),
