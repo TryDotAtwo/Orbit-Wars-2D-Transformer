@@ -56,6 +56,12 @@ if [[ -z "${NVCC_BIN}" || ! -f "${NVCC_BIN}" ]]; then
   exit 127
 fi
 CUTLASS_ROOT="${CUTLASS_PATH:-/opt/cutlass}"
+if [[ ! -d "${CUTLASS_ROOT}/include/cutlass" ]]; then
+  CUTLASS_ROOT="target/cutlass"
+  if [[ ! -d "${CUTLASS_ROOT}/include/cutlass" ]]; then
+    git clone --depth 1 https://github.com/NVIDIA/cutlass.git "${CUTLASS_ROOT}"
+  fi
+fi
 CUTLASS_INCLUDES=()
 if [[ -d "${CUTLASS_ROOT}/include" ]]; then
   CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/include")
