@@ -3439,6 +3439,33 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_read_last_batch(
   return ok();
 }
 
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_last_batch_device_view(
+    OrbitWarsV8CudaModel* model,
+    OrbitWarsV8CudaDeviceBatchView* out_view) {
+  auto* model_state = reinterpret_cast<CudaModelState*>(model);
+  if (!model_state || !out_view) {
+    return bad_argument("null last batch device view argument");
+  }
+  ForwardWorkspace& workspace = model_state->workspace;
+  const size_t request_count = workspace.last_request_count;
+  const size_t token_count = std::max<size_t>(
+      1 + PLANETS,
+      std::min<size_t>(workspace.last_token_count, RESIDENT_TOKEN_COUNT));
+  *out_view = OrbitWarsV8CudaDeviceBatchView{
+      workspace.d_tokens.ptr,
+      workspace.d_token_type_ids.ptr,
+      workspace.d_owner_ids.ptr,
+      workspace.d_padding_mask.ptr,
+      workspace.d_planet_mask.ptr,
+      workspace.d_action_labels.ptr,
+      request_count,
+      token_count,
+      TOKEN_FEATURES,
+      PLANETS,
+      ACTION_SLOTS};
+  return ok();
+}
+
 extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read(
     OrbitWarsCudaSimState* opaque,
     OrbitWarsCudaPlanet* planets,

@@ -73,6 +73,20 @@ typedef struct OrbitWarsCudaActionLabel {
   float confidence[8];
 } OrbitWarsCudaActionLabel;
 
+typedef struct OrbitWarsV8CudaDeviceBatchView {
+  float* tokens;
+  long long* token_type_ids;
+  long long* owner_ids;
+  unsigned char* padding_mask;
+  unsigned char* planet_mask;
+  OrbitWarsCudaActionLabel* labels;
+  size_t request_count;
+  size_t token_count;
+  size_t token_features;
+  size_t planet_count;
+  size_t action_slots;
+} OrbitWarsV8CudaDeviceBatchView;
+
 typedef struct OrbitWarsCudaSimConfig {
   size_t game_count;
   size_t planet_count;
@@ -267,6 +281,10 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_v8_read_last_batch(
     OrbitWarsCudaActionLabel* labels,
     size_t request_capacity,
     size_t* out_request_count);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_v8_last_batch_device_view(
+    OrbitWarsV8CudaModel* model,
+    OrbitWarsV8CudaDeviceBatchView* out_view);
 
 #ifdef __cplusplus
 }

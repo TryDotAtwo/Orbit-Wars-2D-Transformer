@@ -28,6 +28,7 @@ const RESIDENT_MODELS_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_model
 const RESIDENT_MODELS_DECODE_PLAN_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_decode_plan\0";
 const RESIDENT_MODELS_STEP_PLAN_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_step_plan\0";
 const READ_LAST_BATCH_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_read_last_batch\0";
+const LAST_BATCH_DEVICE_VIEW_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_last_batch_device_view\0";
 const DEFAULT_CUDA_V8_LIBRARY_PATH: &str = "target/liborbit_wars_v8_cuda.so";
 const TOKEN_FEATURES: usize = 14;
 const ACTION_SLOTS: usize = 8;
@@ -156,6 +157,40 @@ pub struct OrbitWarsCudaGameStatus {
     pub done: i32,
     pub winner: i32,
     pub step: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct OrbitWarsV8CudaDeviceBatchView {
+    pub tokens: *mut f32,
+    pub token_type_ids: *mut i64,
+    pub owner_ids: *mut i64,
+    pub padding_mask: *mut u8,
+    pub planet_mask: *mut u8,
+    pub labels: *mut OrbitWarsCudaActionLabel,
+    pub request_count: usize,
+    pub token_count: usize,
+    pub token_features: usize,
+    pub planet_count: usize,
+    pub action_slots: usize,
+}
+
+impl Default for OrbitWarsV8CudaDeviceBatchView {
+    fn default() -> Self {
+        Self {
+            tokens: std::ptr::null_mut(),
+            token_type_ids: std::ptr::null_mut(),
+            owner_ids: std::ptr::null_mut(),
+            padding_mask: std::ptr::null_mut(),
+            planet_mask: std::ptr::null_mut(),
+            labels: std::ptr::null_mut(),
+            request_count: 0,
+            token_count: 0,
+            token_features: 0,
+            planet_count: 0,
+            action_slots: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -424,6 +459,10 @@ type ReadLastBatchFn = unsafe extern "C" fn(
     request_capacity: usize,
     out_request_count: *mut usize,
 ) -> OrbitWarsV8CudaStatus;
+type LastBatchDeviceViewFn = unsafe extern "C" fn(
+    model: *mut c_void,
+    out_view: *mut OrbitWarsV8CudaDeviceBatchView,
+) -> OrbitWarsV8CudaStatus;
 
 pub struct V8Cuda {
     library_handle: *mut c_void,
@@ -451,6 +490,7 @@ pub struct V8Cuda {
     resident_models_decode_plan_fn: ResidentModelsDecodePlanFn,
     resident_models_step_plan_fn: ResidentModelsStepPlanFn,
     read_last_batch_fn: ReadLastBatchFn,
+    last_batch_device_view_fn: LastBatchDeviceViewFn,
 }
 
 impl V8Cuda {
@@ -581,6 +621,11 @@ impl V8Cuda {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_read_last_batch_symbol_missing={}", dlerror_text()));
         }
+        let last_batch_device_view_fn = unsafe { dlsym(handle, LAST_BATCH_DEVICE_VIEW_SYMBOL.as_ptr() as *const c_char) };
+        if last_batch_device_view_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_last_batch_device_view_symbol_missing={}", dlerror_text()));
+        }
         Ok(Self {
             library_handle: handle,
             status_fn: unsafe { std::mem::transmute::<*mut c_void, V8StatusFn>(status_fn) },
@@ -606,6 +651,7 @@ impl V8Cuda {
             resident_models_decode_plan_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsDecodePlanFn>(resident_models_decode_plan_fn) },
             resident_models_step_plan_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsStepPlanFn>(resident_models_step_plan_fn) },
             read_last_batch_fn: unsafe { std::mem::transmute::<*mut c_void, ReadLastBatchFn>(read_last_batch_fn) },
+            last_batch_device_view_fn: unsafe { std::mem::transmute::<*mut c_void, LastBatchDeviceViewFn>(last_batch_device_view_fn) },
         })
     }
 
@@ -1042,6 +1088,18 @@ impl Drop for CudaSimState<'_> {
 }
 
 impl V8CudaModel<'_> {
+    pub fn last_batch_device_view(&self) -> Result<OrbitWarsV8CudaDeviceBatchView, String> {
+        let mut view = OrbitWarsV8CudaDeviceBatchView::default();
+        let status = unsafe {
+            (self.cuda.last_batch_device_view_fn)(
+                self.pointer,
+                &mut view as *mut OrbitWarsV8CudaDeviceBatchView,
+            )
+        };
+        require_ok(status, "cuda_last_batch_device_view")?;
+        Ok(view)
+    }
+
     pub fn read_last_batch(&self, request_capacity: usize) -> Result<LastBatchTrace, String> {
         let token_count = RESIDENT_TOKEN_COUNT;
         let mut tokens = vec![0.0f32; request_capacity * token_count * TOKEN_FEATURES];
