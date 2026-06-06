@@ -18,7 +18,7 @@ const DEFAULT_OUTPUT: &str = "dashboard/public/telemetry/latest.json";
 const PLAYER_COUNT_FOUR: usize = 4;
 const PLAYER_IDS: [i32; PLAYER_COUNT_FOUR] = [0, 1, 2, 3];
 const GPU_SIM_PLANETS: usize = 64;
-const GPU_RESIDENT_STATUS_POLL_STRIDE: usize = 16;
+const DEFAULT_GPU_RESIDENT_STATUS_POLL_STRIDE: usize = 16;
 const REPLAY_GAMES_PER_GENERATION: usize = 4;
 const MAP_SEED_BASE: u64 = 0x4f_57_4d_41_50;
 const MAP_GENERATION_SEED_FACTOR: u64 = 1_000_003;
@@ -64,6 +64,7 @@ struct Cli {
     training_trace: Option<PathBuf>,
     training_trace_capacity: usize,
     training_trace_stride: usize,
+    gpu_status_poll_stride: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -187,6 +188,7 @@ fn main() -> Result<(), String> {
             cli.cpu_workers,
             cli.gpu_sim,
             &config,
+            cli.gpu_status_poll_stride,
             training_trace.as_mut(),
         )?;
         if let Some(trace) = training_trace.as_mut() {
@@ -284,6 +286,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         training_trace: None,
         training_trace_capacity: 4096,
         training_trace_stride: 1,
+        gpu_status_poll_stride: DEFAULT_GPU_RESIDENT_STATUS_POLL_STRIDE,
     };
     let mut pending_key: Option<String> = None;
     for arg in args {
@@ -303,7 +306,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             cli.cuda_v8 = true;
         } else if arg == "--gpu-sim" {
             cli.gpu_sim = true;
-        } else if matches!(arg.as_str(), "--games" | "--games-per-model" | "--players" | "--replay-stride" | "--step-limit" | "--workers" | "--cpu-workers" | "--output" | "--model" | "--model-list" | "--training-trace" | "--training-trace-capacity" | "--training-trace-stride") {
+        } else if matches!(arg.as_str(), "--games" | "--games-per-model" | "--players" | "--replay-stride" | "--step-limit" | "--workers" | "--cpu-workers" | "--output" | "--model" | "--model-list" | "--training-trace" | "--training-trace-capacity" | "--training-trace-stride" | "--gpu-status-poll-stride") {
             pending_key = Some(arg);
         } else {
             return Err(format!("unknown_argument={arg}"));
@@ -354,6 +357,12 @@ fn apply_arg(cli: &mut Cli, key: &str, value: &str) -> Result<(), String> {
             cli.training_trace_stride = value.parse().map_err(|_| format!("bad_training_trace_stride={value}"))?;
             if cli.training_trace_stride == 0 {
                 return Err("bad_training_trace_stride=0".to_string());
+            }
+        }
+        "--gpu-status-poll-stride" => {
+            cli.gpu_status_poll_stride = value.parse().map_err(|_| format!("bad_gpu_status_poll_stride={value}"))?;
+            if cli.gpu_status_poll_stride == 0 {
+                return Err("bad_gpu_status_poll_stride=0".to_string());
             }
         }
         _ => return Err(format!("unknown_argument={key}")),
@@ -509,6 +518,7 @@ fn run_cuda_model_tournament(
     cpu_workers: usize,
     gpu_sim: bool,
     config: &AgentConfig,
+    gpu_status_poll_stride: usize,
     mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<Vec<GameResult>, String> {
     let cuda = v8_cuda::V8Cuda::open_from_environment()?;
@@ -542,6 +552,7 @@ fn run_cuda_model_tournament(
             cpu_workers,
             gpu_sim,
             config,
+            gpu_status_poll_stride,
             training_trace.as_deref_mut(),
         )?);
         start = end;
@@ -754,6 +765,7 @@ fn run_cuda_model_game_batch(
     cpu_workers: usize,
     gpu_sim: bool,
     config: &AgentConfig,
+    gpu_status_poll_stride: usize,
     mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<Vec<GameResult>, String> {
     let mut games = schedule
@@ -784,6 +796,7 @@ fn run_cuda_model_game_batch(
                 cuda,
                 replay_stride,
                 player_count,
+                gpu_status_poll_stride,
                 training_trace.as_deref_mut(),
             )?;
             if done_changed {
@@ -1102,6 +1115,7 @@ fn step_active_model_games_gpu_resident(
     cuda: &v8_cuda::V8Cuda,
     replay_stride: usize,
     player_count: usize,
+    gpu_status_poll_stride: usize,
     mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<bool, String> {
     let Some(group) = groups.first_mut() else {
@@ -1165,7 +1179,7 @@ fn step_active_model_games_gpu_resident(
     group.step += 1;
 
     let next_step = group.step;
-    let should_poll_status = next_step % GPU_RESIDENT_STATUS_POLL_STRIDE == 0
+    let should_poll_status = next_step % gpu_status_poll_stride == 0
         || (replay_stride > 0 && next_step % replay_stride == 0);
     if !should_poll_status {
         return Ok(false);

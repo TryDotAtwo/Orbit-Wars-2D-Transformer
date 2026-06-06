@@ -45,6 +45,7 @@ class SelfPlayConfig:
     games_per_candidate: int = 20
     players: int = 4
     replay_stride: int = 500
+    gpu_status_poll_stride: int | None = None
     arena_step_limit: int | None = None
     arena_gpu_sim: bool = True
     training_trace_stride: int = 1
@@ -121,12 +122,18 @@ def main() -> None:
     parser.add_argument("--backprop-lr", type=float, default=1.0e-5)
     parser.add_argument("--target-loss-weight", type=float, default=2.0)
     parser.add_argument("--replay-stride", type=int, default=500)
+    parser.add_argument("--gpu-status-poll-stride", type=int)
     parser.add_argument("--training-trace-stride", type=int, default=1)
     parser.add_argument("--max-selfplay-samples", type=int)
     parser.add_argument("--dashboard-telemetry", type=Path, default=Path("dashboard/public/telemetry/latest.json"))
     parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--device", default=None)
     parser.add_argument("--rl-single-model", action="store_true", help="Train one model from self-play outcomes only; no GA, no mutations.")
+    parser.add_argument(
+        "--cpu-training-trace",
+        action="store_true",
+        help="Debug-only: copy per-tick training samples from the arena to CPU. This is intentionally off for GPU-resident RL.",
+    )
     args = parser.parse_args()
     if not args.base_checkpoint and not args.base_model_bin:
         parser.error("one of --base-checkpoint or --base-model-bin is required")
@@ -148,6 +155,7 @@ def main() -> None:
         backprop_lr=args.backprop_lr,
         target_loss_weight=args.target_loss_weight,
         replay_stride=args.replay_stride,
+        gpu_status_poll_stride=args.gpu_status_poll_stride,
     )
     if args.rl_single_model:
         run_single_model_rl(
@@ -162,6 +170,7 @@ def main() -> None:
             config=config,
             dashboard_telemetry=None if args.no_dashboard else args.dashboard_telemetry,
             device=args.device,
+            cpu_training_trace=args.cpu_training_trace,
         )
     else:
         run_selfplay(
@@ -259,6 +268,7 @@ def run_selfplay(
                 workers=effective_arena_workers,
                 cpu_workers=arena_cpu_workers,
                 gpu_sim=config.arena_gpu_sim,
+                gpu_status_poll_stride=config.gpu_status_poll_stride,
                 training_trace_path=training_trace_path,
                 training_trace_capacity=config.training_trace_capacity(),
                 training_trace_stride=config.training_trace_stride,
@@ -388,6 +398,7 @@ def run_single_model_rl(
     config: SelfPlayConfig,
     dashboard_telemetry: Path | None,
     device: str | None,
+    cpu_training_trace: bool,
 ) -> Path:
     if arena_backend != "rust-cuda-population":
         raise ValueError("--rl-single-model currently requires --arena-backend=rust-cuda-population")
@@ -409,7 +420,8 @@ def run_single_model_rl(
         "reward": {"win": 1.0, "loss": -1.0, "draw": -1.0},
         "config": asdict(config),
         "arena_games_per_generation": config.games_per_candidate,
-        "training_trace_capacity": trace_capacity,
+        "cpu_training_trace": cpu_training_trace,
+        "training_trace_capacity": trace_capacity if cpu_training_trace else 0,
     }), flush=True)
 
     for generation in range(1, config.generations + 1):
@@ -417,7 +429,7 @@ def run_single_model_rl(
         generation_dir.mkdir(parents=True, exist_ok=True)
         candidates = make_single_model_players(current_state, model_config, generation_dir, generation, config.players)
         telemetry_path = generation_dir / f"generation-{generation:04d}.single_rl.telemetry.json"
-        training_trace_path = generation_dir / f"generation-{generation:04d}.single_rl.training_trace.jsonl"
+        training_trace_path = generation_dir / f"generation-{generation:04d}.single_rl.training_trace.jsonl" if cpu_training_trace else None
         effective_arena_workers = arena_workers
         if effective_arena_workers <= 0:
             effective_arena_workers = max(1, config.games_per_candidate)
@@ -435,13 +447,14 @@ def run_single_model_rl(
             workers=effective_arena_workers,
             cpu_workers=arena_cpu_workers,
             gpu_sim=config.arena_gpu_sim,
+            gpu_status_poll_stride=config.gpu_status_poll_stride or (config.arena_step_limit or 500),
             training_trace_path=training_trace_path,
-            training_trace_capacity=trace_capacity,
-            training_trace_stride=config.training_trace_stride,
+            training_trace_capacity=trace_capacity if cpu_training_trace else None,
+            training_trace_stride=config.training_trace_stride if cpu_training_trace else None,
         )
         arena_seconds = time.perf_counter() - started
         telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
-        selfplay_samples = samples_from_training_trace(training_trace_path)
+        selfplay_samples = samples_from_training_trace(training_trace_path) if training_trace_path else []
         aggregate = single_rl_candidate_result(
             generation,
             telemetry_path,
@@ -470,7 +483,13 @@ def run_single_model_rl(
                 device,
             )
         else:
-            backprop_metrics = {"samples": 0, "loss": 0.0}
+            backprop_metrics = {
+                "samples": 0,
+                "loss": 0.0,
+                "gpu_resident_rollout": True,
+                "cpu_training_trace": False,
+                "note": "CPU trace disabled; device-side RL loss/backprop is required for true GPU-only training.",
+            }
         backprop_metrics["arena_seconds"] = float(arena_seconds)
         backprop_metrics["arena_games_per_second"] = config.games_per_candidate / max(1.0e-9, arena_seconds)
 
@@ -740,9 +759,10 @@ def run_population_arena(
     workers: int,
     cpu_workers: int,
     gpu_sim: bool,
-    training_trace_path: Path,
-    training_trace_capacity: int,
-    training_trace_stride: int,
+    gpu_status_poll_stride: int | None,
+    training_trace_path: Path | None,
+    training_trace_capacity: int | None,
+    training_trace_stride: int | None,
 ) -> None:
     model_list = generation_dir / "models.txt"
     model_list.write_text(
@@ -752,7 +772,6 @@ def run_population_arena(
     arena_arg = command_path(arena_bin, docker_style=bool(arena_prefix))
     model_list_arg = command_path(model_list, docker_style=bool(arena_prefix))
     telemetry_arg = command_path(telemetry_path, docker_style=bool(arena_prefix))
-    training_trace_arg = command_path(training_trace_path, docker_style=bool(arena_prefix))
     command = [
         *arena_prefix,
         arena_arg,
@@ -764,10 +783,16 @@ def run_population_arena(
         f"--workers={workers}",
         f"--cpu-workers={cpu_workers}",
         f"--output={telemetry_arg}",
-        f"--training-trace={training_trace_arg}",
-        f"--training-trace-capacity={training_trace_capacity}",
-        f"--training-trace-stride={training_trace_stride}",
     ]
+    if gpu_status_poll_stride is not None:
+        command.append(f"--gpu-status-poll-stride={gpu_status_poll_stride}")
+    if training_trace_path is not None:
+        training_trace_arg = command_path(training_trace_path, docker_style=bool(arena_prefix))
+        command.extend([
+            f"--training-trace={training_trace_arg}",
+            f"--training-trace-capacity={training_trace_capacity}",
+            f"--training-trace-stride={training_trace_stride}",
+        ])
     if step_limit is not None:
         command.append(f"--step-limit={step_limit}")
     if gpu_sim:
@@ -794,7 +819,7 @@ def run_population_arena(
         "cpu_workers": cpu_workers,
         "gpu_sim": gpu_sim,
         "telemetry": str(telemetry_path),
-        "training_trace": str(training_trace_path),
+        "training_trace": str(training_trace_path) if training_trace_path else None,
         "seconds": round(time.perf_counter() - started, 3),
         "arena_tail": arena_lines[-3:],
     }, ensure_ascii=False), flush=True)
