@@ -23,17 +23,48 @@ def compute_resident_policy_loss(
     +1 for wins and -1 for losses/draws.  The function maximizes selected-action
     log probability for positive rewards and minimizes it for negative rewards.
     """
-    device = outputs["fire_logits"].device
-    labels_fire = batch.labels_fire.to(device=device, dtype=torch.float32)
-    labels_source = batch.labels_source.to(device=device, dtype=torch.long)
-    labels_target = batch.labels_target.to(device=device, dtype=torch.long)
-    labels_amount = batch.labels_amount.to(device=device, dtype=torch.long)
+    selected_logprob, labels_fire = compute_resident_selected_logprob(
+        outputs,
+        batch,
+        source_weight=source_weight,
+        target_weight=target_weight,
+        amount_weight=amount_weight,
+        fire_weight=fire_weight,
+    )
+    device = selected_logprob.device
     rewards = rewards.to(device=device, dtype=torch.float32)
     if rewards.ndim == 1:
         rewards = rewards[:, None].expand_as(labels_fire)
     if rewards.shape != labels_fire.shape:
         raise ValueError(f"bad rewards shape {tuple(rewards.shape)} expected {tuple(labels_fire.shape)}")
 
+    # Policy gradient objective: minimize -reward * logprob.
+    loss = -(rewards * selected_logprob).mean()
+    active_count = (labels_fire > 0.5).sum().detach()
+    metrics = {
+        "loss": float(loss.detach().cpu()),
+        "active_slots": float(active_count.cpu()),
+        "mean_reward": float(rewards.detach().mean().cpu()),
+        "mean_selected_logprob": float(selected_logprob.detach().mean().cpu()),
+    }
+    return loss, metrics
+
+
+def compute_resident_selected_logprob(
+    outputs: dict[str, torch.Tensor],
+    batch: ResidentBatchTensorView,
+    *,
+    source_weight: float = 1.0,
+    target_weight: float = 1.0,
+    amount_weight: float = 0.75,
+    fire_weight: float = 0.35,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return per-request/slot selected log-probability and fire labels on GPU."""
+    device = outputs["fire_logits"].device
+    labels_fire = batch.labels_fire.to(device=device, dtype=torch.float32)
+    labels_source = batch.labels_source.to(device=device, dtype=torch.long)
+    labels_target = batch.labels_target.to(device=device, dtype=torch.long)
+    labels_amount = batch.labels_amount.to(device=device, dtype=torch.long)
     active = labels_fire > 0.5
     fire_logprob = -nn.functional.binary_cross_entropy_with_logits(
         outputs["fire_logits"],
@@ -53,15 +84,4 @@ def compute_resident_policy_loss(
             + target_weight * target_logprob.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
             + amount_weight * amount_logprob.gather(-1, safe_amount.unsqueeze(-1)).squeeze(-1)
         )
-
-    # Policy gradient objective: minimize -reward * logprob.
-    loss = -(rewards * selected_logprob).mean()
-    active_count = active.sum().detach()
-    metrics = {
-        "loss": float(loss.detach().cpu()),
-        "active_slots": float(active_count.cpu()),
-        "mean_reward": float(rewards.detach().mean().cpu()),
-        "mean_selected_logprob": float(selected_logprob.detach().mean().cpu()),
-    }
-    return loss, metrics
-
+    return selected_logprob, labels_fire
