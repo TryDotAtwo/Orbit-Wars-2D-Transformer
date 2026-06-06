@@ -2,6 +2,7 @@
 set -euo pipefail
 
 mkdir -p target
+CUDA_STACK="${CUDA_STACK:-cu12}"
 PYTHON_BIN="${PYTHON:-}"
 if [[ -z "${PYTHON_BIN}" ]]; then
   PYTHON_BIN="$(command -v python || command -v python3)"
@@ -25,10 +26,13 @@ if [[ -z "${NVCC_BIN}" ]]; then
   NVCC_BIN="$(command -v nvcc || true)"
 fi
 if [[ -z "${NVCC_BIN}" ]]; then
-  NVCC_BIN="$("${PYTHON_BIN}" - <<'PY'
+  NVCC_BIN="$("${PYTHON_BIN}" - "${CUDA_STACK}" <<'PY'
 import pathlib
 import site
+import sys
 
+stack = sys.argv[1]
+all_candidates = []
 for root in site.getsitepackages() + [site.getusersitepackages()]:
     nvidia_root = pathlib.Path(root) / "nvidia"
     if not nvidia_root.exists():
@@ -39,14 +43,23 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
     ]
     for candidate in candidates:
         if candidate.exists() and candidate.is_file():
-            try:
-                candidate.chmod(candidate.stat().st_mode | 0o111)
-            except Exception:
-                pass
-            print(candidate)
-            break
-    else:
-        continue
+            text = str(candidate)
+            if stack == "cu12" and "/cu13/" in text.replace("\\", "/"):
+                continue
+            all_candidates.append(candidate)
+preferred = sorted(
+    all_candidates,
+    key=lambda path: (
+        0 if "cuda_nvcc" in str(path).replace("\\", "/") else 1,
+        str(path),
+    ),
+)
+for candidate in preferred:
+    try:
+        candidate.chmod(candidate.stat().st_mode | 0o111)
+    except Exception:
+        pass
+    print(candidate)
     break
 PY
 )"
@@ -69,10 +82,12 @@ fi
 if [[ -d "${CUTLASS_ROOT}/tools/util/include" ]]; then
   CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/tools/util/include")
 fi
-CUDA_PIP_FLAGS="$("${PYTHON_BIN}" - <<'PY'
+CUDA_PIP_FLAGS="$("${PYTHON_BIN}" - "${CUDA_STACK}" <<'PY'
 import pathlib
 import site
+import sys
 
+stack = sys.argv[1]
 include_flags = []
 lib_flags = []
 seen_includes = set()
@@ -82,6 +97,9 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
     if not nvidia_root.exists():
         continue
     for include in nvidia_root.rglob("include"):
+        include_text = str(include).replace("\\", "/")
+        if stack == "cu12" and "/cu13/" in include_text:
+            continue
         if (
             (include / "cuda_runtime.h").exists()
             or (include / "nv" / "target").exists()
@@ -90,6 +108,9 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
             include_flags.append(f"-I{include}")
             seen_includes.add(include)
     for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):
+        lib_text = str(lib_dir).replace("\\", "/")
+        if stack == "cu12" and "/cu13/" in lib_text:
+            continue
         if any(lib_dir.glob("libcudart.so*")) and lib_dir not in seen_libs:
             lib_flags.append(f"-L{lib_dir}")
             seen_libs.add(lib_dir)
@@ -97,10 +118,12 @@ print(" ".join(include_flags + lib_flags))
 PY
 )"
 read -r -a CUDA_PIP_ARGS <<< "${CUDA_PIP_FLAGS}"
-CUDA_PIP_LIB_PATHS="$("${PYTHON_BIN}" - <<'PY'
+CUDA_PIP_LIB_PATHS="$("${PYTHON_BIN}" - "${CUDA_STACK}" <<'PY'
 import pathlib
 import site
+import sys
 
+stack = sys.argv[1]
 paths = []
 seen = set()
 for root in site.getsitepackages() + [site.getusersitepackages()]:
@@ -108,6 +131,9 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
     if not nvidia_root.exists():
         continue
     for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):
+        lib_text = str(lib_dir).replace("\\", "/")
+        if stack == "cu12" and "/cu13/" in lib_text:
+            continue
         if any(lib_dir.glob("libcudart.so*")) and lib_dir not in seen:
             paths.append(str(lib_dir))
             seen.add(lib_dir)
