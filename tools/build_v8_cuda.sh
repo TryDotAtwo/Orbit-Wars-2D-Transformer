@@ -26,15 +26,29 @@ import pathlib
 import site
 
 for root in site.getsitepackages() + [site.getusersitepackages()]:
-    candidate = pathlib.Path(root) / "nvidia" / "cuda_nvcc" / "bin" / "nvcc"
-    if candidate.exists():
+    nvidia_root = pathlib.Path(root) / "nvidia"
+    if not nvidia_root.exists():
+        continue
+    candidates = [
+        nvidia_root / "cuda_nvcc" / "bin" / "nvcc",
+        *nvidia_root.rglob("nvcc"),
+    ]
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            try:
+                candidate.chmod(candidate.stat().st_mode | 0o111)
+            except Exception:
+                pass
         print(candidate)
         break
+    else:
+        continue
+    break
 PY
 )"
 fi
-if [[ -z "${NVCC_BIN}" || ! -x "${NVCC_BIN}" ]]; then
-  echo "nvcc not found; install nvidia-cuda-nvcc-cu13 or set NVCC=/path/to/nvcc" >&2
+if [[ -z "${NVCC_BIN}" || ! -f "${NVCC_BIN}" ]]; then
+  echo "nvcc not found; install cuda-toolkit[nvcc] or set NVCC=/path/to/nvcc" >&2
   exit 127
 fi
 CUTLASS_ROOT="${CUTLASS_PATH:-/opt/cutlass}"
