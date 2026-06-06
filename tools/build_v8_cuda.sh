@@ -2,8 +2,12 @@
 set -euo pipefail
 
 mkdir -p target
+PYTHON_BIN="${PYTHON:-}"
+if [[ -z "${PYTHON_BIN}" ]]; then
+  PYTHON_BIN="$(command -v python || command -v python3)"
+fi
 if [[ -z "${CUDA_ARCH:-}" ]]; then
-  CUDA_ARCH="$(python3 - <<'PY'
+  CUDA_ARCH="$("${PYTHON_BIN}" - <<'PY'
 try:
     import torch
     if torch.cuda.is_available():
@@ -21,7 +25,7 @@ if [[ -z "${NVCC_BIN}" ]]; then
   NVCC_BIN="$(command -v nvcc || true)"
 fi
 if [[ -z "${NVCC_BIN}" ]]; then
-  NVCC_BIN="$(python3 - <<'PY'
+  NVCC_BIN="$("${PYTHON_BIN}" - <<'PY'
 import pathlib
 import site
 
