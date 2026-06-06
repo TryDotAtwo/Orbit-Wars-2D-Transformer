@@ -43,8 +43,8 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
                 candidate.chmod(candidate.stat().st_mode | 0o111)
             except Exception:
                 pass
-        print(candidate)
-        break
+            print(candidate)
+            break
     else:
         continue
     break
