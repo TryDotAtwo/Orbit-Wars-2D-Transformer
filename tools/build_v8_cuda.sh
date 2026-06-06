@@ -82,12 +82,28 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
     for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):
         if any(lib_dir.glob("libcudart.so*")) and lib_dir not in seen_libs:
             lib_flags.append(f"-L{lib_dir}")
-            lib_flags.append(f"-Wl,-rpath,{lib_dir}")
             seen_libs.add(lib_dir)
 print(" ".join(include_flags + lib_flags))
 PY
 )"
 read -r -a CUDA_PIP_ARGS <<< "${CUDA_PIP_FLAGS}"
+CUDA_PIP_LIB_PATHS="$("${PYTHON_BIN}" - <<'PY'
+import pathlib
+import site
+
+paths = []
+seen = set()
+for root in site.getsitepackages() + [site.getusersitepackages()]:
+    nvidia_root = pathlib.Path(root) / "nvidia"
+    if not nvidia_root.exists():
+        continue
+    for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):
+        if any(lib_dir.glob("libcudart.so*")) and lib_dir not in seen:
+            paths.append(str(lib_dir))
+            seen.add(lib_dir)
+print(":".join(paths))
+PY
+)"
 "${NVCC_BIN}" -std=c++17 -O3 "-arch=${CUDA_ARCH}" -shared -Xcompiler -fPIC \
   "${CUTLASS_INCLUDES[@]}" \
   "${CUDA_PIP_ARGS[@]}" \
@@ -100,4 +116,4 @@ g++ -std=c++17 -O3 \
   -lorbit_wars_v8_cuda \
   -Wl,-rpath,'$ORIGIN' \
   -o target/orbit_wars_v8_cuda_smoke
-LD_LIBRARY_PATH=target ./target/orbit_wars_v8_cuda_smoke
+LD_LIBRARY_PATH="target:${CUDA_PIP_LIB_PATHS}:${LD_LIBRARY_PATH:-}" ./target/orbit_wars_v8_cuda_smoke
