@@ -63,8 +63,34 @@ fi
 if [[ -d "${CUTLASS_ROOT}/tools/util/include" ]]; then
   CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/tools/util/include")
 fi
+CUDA_PIP_FLAGS="$("${PYTHON_BIN}" - <<'PY'
+import pathlib
+import site
+
+include_flags = []
+lib_flags = []
+seen_includes = set()
+seen_libs = set()
+for root in site.getsitepackages() + [site.getusersitepackages()]:
+    nvidia_root = pathlib.Path(root) / "nvidia"
+    if not nvidia_root.exists():
+        continue
+    for include in nvidia_root.rglob("include"):
+        if (include / "cuda_runtime.h").exists() and include not in seen_includes:
+            include_flags.append(f"-I{include}")
+            seen_includes.add(include)
+    for lib_dir in list(nvidia_root.rglob("lib")) + list(nvidia_root.rglob("lib64")):
+        if any(lib_dir.glob("libcudart.so*")) and lib_dir not in seen_libs:
+            lib_flags.append(f"-L{lib_dir}")
+            lib_flags.append(f"-Wl,-rpath,{lib_dir}")
+            seen_libs.add(lib_dir)
+print(" ".join(include_flags + lib_flags))
+PY
+)"
+read -r -a CUDA_PIP_ARGS <<< "${CUDA_PIP_FLAGS}"
 "${NVCC_BIN}" -std=c++17 -O3 "-arch=${CUDA_ARCH}" -shared -Xcompiler -fPIC \
   "${CUTLASS_INCLUDES[@]}" \
+  "${CUDA_PIP_ARGS[@]}" \
   native/cuda/orbit_wars_v8_cuda.cu \
   -o target/liborbit_wars_v8_cuda.so
 g++ -std=c++17 -O3 \
