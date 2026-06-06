@@ -50,19 +50,15 @@ torch::Tensor wrap_cuda_ptr(
 }
 
 }  // namespace
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("wrap_cuda_ptr", &wrap_cuda_ptr, "Create a non-owning CUDA tensor view");
-}
 """
 
 
 @lru_cache(maxsize=1)
 def _extension():
     return load_inline(
-        name="orbit_wars_cuda_tensor_view",
+        name="orbit_wars_cuda_tensor_view_v2",
         cpp_sources=[_CPP_SOURCE],
-        functions=[],
+        functions=["wrap_cuda_ptr"],
         with_cuda=False,
         extra_cflags=["-O3"],
         verbose=False,
