@@ -1,10 +1,19 @@
 #include "orbit_wars_v8_cuda.h"
 
-#include <cublas_v2.h>
+#include <cutlass/arch/mma.h>
+#include <cutlass/gemm/device/gemm.h>
+#include <cutlass/gemm/device/gemm_grouped.h>
+#include <cutlass/gemm/gemm.h>
+#include <cutlass/gemm/kernel/default_gemm_grouped.h>
+#include <cutlass/layout/matrix.h>
+#include <cutlass/epilogue/thread/linear_combination.h>
+
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -32,22 +41,64 @@ constexpr int RESIDENT_TOKEN_COUNT = 1 + PLANETS + MAX_TOKEN_FLEETS;
 constexpr float LAYER_NORM_EPS = 1.0e-5f;
 constexpr float NEG_INF = -3.402823466e38f;
 
-cublasHandle_t g_cublas_handle = nullptr;
+using CutlassLinearGemm = cutlass::gemm::device::Gemm<
+    float,
+    cutlass::layout::RowMajor,
+    float,
+    cutlass::layout::ColumnMajor,
+    float,
+    cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<32, 32, 32>,
+    cutlass::gemm::GemmShape<16, 8, 8>>;
 
-cudaError_t ensure_cublas_handle() {
-  if (g_cublas_handle) {
-    return cudaSuccess;
-  }
-  cublasStatus_t status = cublasCreate(&g_cublas_handle);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return cudaErrorInitializationError;
-  }
-  status = cublasSetMathMode(g_cublas_handle, CUBLAS_TF32_TENSOR_OP_MATH);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return cudaErrorInitializationError;
-  }
-  return cudaSuccess;
-}
+using CutlassLinearGemmSimt = cutlass::gemm::device::Gemm<
+    float,
+    cutlass::layout::RowMajor,
+    float,
+    cutlass::layout::ColumnMajor,
+    float,
+    cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassSimt,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 64, 8>,
+    cutlass::gemm::GemmShape<32, 32, 8>,
+    cutlass::gemm::GemmShape<1, 1, 1>>;
+
+using CutlassGroupedLinearOutputOp = cutlass::epilogue::thread::LinearCombination<
+    float,
+    1,
+    float,
+    float>;
+
+using CutlassGroupedLinearKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+    float,
+    cutlass::layout::RowMajor,
+    cutlass::ComplexTransform::kNone,
+    1,
+    float,
+    cutlass::layout::ColumnMajor,
+    cutlass::ComplexTransform::kNone,
+    1,
+    float,
+    cutlass::layout::RowMajor,
+    float,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<128, 128, 32>,
+    cutlass::gemm::GemmShape<64, 64, 32>,
+    cutlass::gemm::GemmShape<16, 8, 8>,
+    CutlassGroupedLinearOutputOp,
+    cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+    3,
+    cutlass::gemm::kernel::GroupScheduleMode::kHostPrecompute,
+    cutlass::arch::OpMultiplyAddFastF32>::GemmKernel;
+
+using CutlassGroupedLinearGemm = cutlass::gemm::device::GemmGrouped<CutlassGroupedLinearKernel>;
 
 OrbitWarsV8CudaStatus ok() {
   return {CUDA_STATUS_OK, "ok"};
@@ -135,6 +186,61 @@ struct DeviceTensor {
 
 using TensorMap = std::unordered_map<std::string, DeviceTensor>;
 
+struct EncoderLayerWeights {
+  const float* self_attn_in_proj_weight = nullptr;
+  const float* self_attn_in_proj_bias = nullptr;
+  const float* self_attn_out_proj_weight = nullptr;
+  const float* self_attn_out_proj_bias = nullptr;
+  const float* linear1_weight = nullptr;
+  const float* linear1_bias = nullptr;
+  const float* linear2_weight = nullptr;
+  const float* linear2_bias = nullptr;
+  const float* norm1_weight = nullptr;
+  const float* norm1_bias = nullptr;
+  const float* norm2_weight = nullptr;
+  const float* norm2_bias = nullptr;
+};
+
+struct DecoderLayerWeights {
+  const float* self_attn_in_proj_weight = nullptr;
+  const float* self_attn_in_proj_bias = nullptr;
+  const float* self_attn_out_proj_weight = nullptr;
+  const float* self_attn_out_proj_bias = nullptr;
+  const float* cross_attn_in_proj_weight = nullptr;
+  const float* cross_attn_in_proj_bias = nullptr;
+  const float* cross_attn_out_proj_weight = nullptr;
+  const float* cross_attn_out_proj_bias = nullptr;
+  const float* linear1_weight = nullptr;
+  const float* linear1_bias = nullptr;
+  const float* linear2_weight = nullptr;
+  const float* linear2_bias = nullptr;
+  const float* norm1_weight = nullptr;
+  const float* norm1_bias = nullptr;
+  const float* norm2_weight = nullptr;
+  const float* norm2_bias = nullptr;
+  const float* norm3_weight = nullptr;
+  const float* norm3_bias = nullptr;
+};
+
+struct PackedModelWeights {
+  const float* token_projection_weight = nullptr;
+  const float* token_projection_bias = nullptr;
+  const float* type_embedding = nullptr;
+  const float* owner_embedding = nullptr;
+  const float* slot_queries = nullptr;
+  EncoderLayerWeights encoder[ENCODER_LAYERS];
+  DecoderLayerWeights decoder[DECODER_LAYERS];
+  const float* fire_head_weight = nullptr;
+  const float* fire_head_bias = nullptr;
+  const float* source_head_weight = nullptr;
+  const float* source_head_bias = nullptr;
+  const float* target_head_weight = nullptr;
+  const float* target_head_bias = nullptr;
+  const float* amount_head_weight = nullptr;
+  const float* amount_head_bias = nullptr;
+  bool valid = false;
+};
+
 struct ForwardWorkspace {
   DeviceBuffer<float> d_tokens;
   DeviceBuffer<long long> d_token_type_ids;
@@ -167,11 +273,15 @@ struct ForwardWorkspace {
   DeviceBuffer<float> d_amount;
   DeviceBuffer<int> request_game_indices;
   DeviceBuffer<int> request_player_ids;
+  DeviceBuffer<OrbitWarsCudaActionLabel> d_action_labels;
+  size_t last_request_count = 0;
+  size_t last_token_count = RESIDENT_TOKEN_COUNT;
 };
 
 struct CudaModelState {
   std::vector<std::unique_ptr<DeviceBuffer<float>>> owned_tensors;
   TensorMap tensor_map;
+  PackedModelWeights weights;
   ForwardWorkspace workspace;
 };
 
@@ -193,6 +303,20 @@ struct CudaSimState {
   DeviceBuffer<float> old_y;
   DeviceBuffer<float> new_x;
   DeviceBuffer<float> new_y;
+  DeviceBuffer<int> request_game_indices;
+  DeviceBuffer<int> request_player_ids;
+  DeviceBuffer<cutlass::gemm::GemmCoord> grouped_problem_sizes;
+  DeviceBuffer<float*> grouped_ptr_a;
+  DeviceBuffer<float*> grouped_ptr_b;
+  DeviceBuffer<float*> grouped_ptr_c;
+  DeviceBuffer<float*> grouped_ptr_d;
+  DeviceBuffer<int64_t> grouped_lda;
+  DeviceBuffer<int64_t> grouped_ldb;
+  DeviceBuffer<int64_t> grouped_ldc;
+  DeviceBuffer<int64_t> grouped_ldd;
+  DeviceBuffer<uint8_t> grouped_workspace;
+  size_t request_plan_count = 0;
+  int resident_token_count = RESIDENT_TOKEN_COUNT;
 };
 
 struct CudaSimKernelState {
@@ -239,6 +363,92 @@ CudaSimKernelState sim_kernel_state(CudaSimState* state) {
 const float* tensor_ptr(const TensorMap& map, const char* name) {
   auto found = map.find(name);
   return found == map.end() ? nullptr : found->second.ptr;
+}
+
+bool build_packed_weights(const TensorMap& map, PackedModelWeights* weights) {
+  if (!weights) return false;
+  PackedModelWeights packed{};
+  packed.token_projection_weight = tensor_ptr(map, "token_projection.weight");
+  packed.token_projection_bias = tensor_ptr(map, "token_projection.bias");
+  packed.type_embedding = tensor_ptr(map, "type_embedding.weight");
+  packed.owner_embedding = tensor_ptr(map, "owner_embedding.weight");
+  packed.slot_queries = tensor_ptr(map, "slot_queries");
+  packed.fire_head_weight = tensor_ptr(map, "fire_head.weight");
+  packed.fire_head_bias = tensor_ptr(map, "fire_head.bias");
+  packed.source_head_weight = tensor_ptr(map, "source_head.weight");
+  packed.source_head_bias = tensor_ptr(map, "source_head.bias");
+  packed.target_head_weight = tensor_ptr(map, "target_head.weight");
+  packed.target_head_bias = tensor_ptr(map, "target_head.bias");
+  packed.amount_head_weight = tensor_ptr(map, "amount_head.weight");
+  packed.amount_head_bias = tensor_ptr(map, "amount_head.bias");
+  for (int layer = 0; layer < ENCODER_LAYERS; ++layer) {
+    std::string prefix = "encoder.layers." + std::to_string(layer);
+    EncoderLayerWeights& layer_weights = packed.encoder[layer];
+    layer_weights.self_attn_in_proj_weight = tensor_ptr(map, (prefix + ".self_attn.in_proj_weight").c_str());
+    layer_weights.self_attn_in_proj_bias = tensor_ptr(map, (prefix + ".self_attn.in_proj_bias").c_str());
+    layer_weights.self_attn_out_proj_weight = tensor_ptr(map, (prefix + ".self_attn.out_proj.weight").c_str());
+    layer_weights.self_attn_out_proj_bias = tensor_ptr(map, (prefix + ".self_attn.out_proj.bias").c_str());
+    layer_weights.linear1_weight = tensor_ptr(map, (prefix + ".linear1.weight").c_str());
+    layer_weights.linear1_bias = tensor_ptr(map, (prefix + ".linear1.bias").c_str());
+    layer_weights.linear2_weight = tensor_ptr(map, (prefix + ".linear2.weight").c_str());
+    layer_weights.linear2_bias = tensor_ptr(map, (prefix + ".linear2.bias").c_str());
+    layer_weights.norm1_weight = tensor_ptr(map, (prefix + ".norm1.weight").c_str());
+    layer_weights.norm1_bias = tensor_ptr(map, (prefix + ".norm1.bias").c_str());
+    layer_weights.norm2_weight = tensor_ptr(map, (prefix + ".norm2.weight").c_str());
+    layer_weights.norm2_bias = tensor_ptr(map, (prefix + ".norm2.bias").c_str());
+  }
+  for (int layer = 0; layer < DECODER_LAYERS; ++layer) {
+    std::string prefix = "decoder.layers." + std::to_string(layer);
+    DecoderLayerWeights& layer_weights = packed.decoder[layer];
+    layer_weights.self_attn_in_proj_weight = tensor_ptr(map, (prefix + ".self_attn.in_proj_weight").c_str());
+    layer_weights.self_attn_in_proj_bias = tensor_ptr(map, (prefix + ".self_attn.in_proj_bias").c_str());
+    layer_weights.self_attn_out_proj_weight = tensor_ptr(map, (prefix + ".self_attn.out_proj.weight").c_str());
+    layer_weights.self_attn_out_proj_bias = tensor_ptr(map, (prefix + ".self_attn.out_proj.bias").c_str());
+    layer_weights.cross_attn_in_proj_weight = tensor_ptr(map, (prefix + ".multihead_attn.in_proj_weight").c_str());
+    layer_weights.cross_attn_in_proj_bias = tensor_ptr(map, (prefix + ".multihead_attn.in_proj_bias").c_str());
+    layer_weights.cross_attn_out_proj_weight = tensor_ptr(map, (prefix + ".multihead_attn.out_proj.weight").c_str());
+    layer_weights.cross_attn_out_proj_bias = tensor_ptr(map, (prefix + ".multihead_attn.out_proj.bias").c_str());
+    layer_weights.linear1_weight = tensor_ptr(map, (prefix + ".linear1.weight").c_str());
+    layer_weights.linear1_bias = tensor_ptr(map, (prefix + ".linear1.bias").c_str());
+    layer_weights.linear2_weight = tensor_ptr(map, (prefix + ".linear2.weight").c_str());
+    layer_weights.linear2_bias = tensor_ptr(map, (prefix + ".linear2.bias").c_str());
+    layer_weights.norm1_weight = tensor_ptr(map, (prefix + ".norm1.weight").c_str());
+    layer_weights.norm1_bias = tensor_ptr(map, (prefix + ".norm1.bias").c_str());
+    layer_weights.norm2_weight = tensor_ptr(map, (prefix + ".norm2.weight").c_str());
+    layer_weights.norm2_bias = tensor_ptr(map, (prefix + ".norm2.bias").c_str());
+    layer_weights.norm3_weight = tensor_ptr(map, (prefix + ".norm3.weight").c_str());
+    layer_weights.norm3_bias = tensor_ptr(map, (prefix + ".norm3.bias").c_str());
+  }
+  const bool ok =
+      packed.token_projection_weight && packed.token_projection_bias && packed.type_embedding &&
+      packed.owner_embedding && packed.slot_queries && packed.fire_head_weight && packed.fire_head_bias &&
+      packed.source_head_weight && packed.source_head_bias && packed.target_head_weight &&
+      packed.target_head_bias && packed.amount_head_weight && packed.amount_head_bias;
+  if (!ok) return false;
+  for (int layer = 0; layer < ENCODER_LAYERS; ++layer) {
+    const EncoderLayerWeights& w = packed.encoder[layer];
+    if (!w.self_attn_in_proj_weight || !w.self_attn_in_proj_bias ||
+        !w.self_attn_out_proj_weight || !w.self_attn_out_proj_bias ||
+        !w.linear1_weight || !w.linear1_bias || !w.linear2_weight || !w.linear2_bias ||
+        !w.norm1_weight || !w.norm1_bias || !w.norm2_weight || !w.norm2_bias) {
+      return false;
+    }
+  }
+  for (int layer = 0; layer < DECODER_LAYERS; ++layer) {
+    const DecoderLayerWeights& w = packed.decoder[layer];
+    if (!w.self_attn_in_proj_weight || !w.self_attn_in_proj_bias ||
+        !w.self_attn_out_proj_weight || !w.self_attn_out_proj_bias ||
+        !w.cross_attn_in_proj_weight || !w.cross_attn_in_proj_bias ||
+        !w.cross_attn_out_proj_weight || !w.cross_attn_out_proj_bias ||
+        !w.linear1_weight || !w.linear1_bias || !w.linear2_weight || !w.linear2_bias ||
+        !w.norm1_weight || !w.norm1_bias || !w.norm2_weight || !w.norm2_bias ||
+        !w.norm3_weight || !w.norm3_bias) {
+      return false;
+    }
+  }
+  packed.valid = true;
+  *weights = packed;
+  return true;
 }
 
 __device__ float gelu_device(float value) {
@@ -312,55 +522,11 @@ __global__ void layer_norm_kernel(
   }
 }
 
-__global__ void linear_kernel(
-    const float* input,
-    const float* weight,
-    const float* bias,
-    float* output,
-    int rows,
-    int in_features,
-    int out_features) {
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = rows * out_features;
-  if (index >= total) return;
-  int out = index % out_features;
-  int row = index / out_features;
-  float value = bias[out];
-  const float* input_row = input + row * in_features;
-  const float* weight_row = weight + out * in_features;
-  for (int dim = 0; dim < in_features; ++dim) {
-    value += weight_row[dim] * input_row[dim];
-  }
-  output[index] = value;
-}
-
 __global__ void add_linear_bias_kernel(float* output, const float* bias, int rows, int out_features) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   int total = rows * out_features;
   if (index >= total) return;
   output[index] += bias[index % out_features];
-}
-
-__global__ void qkv_project_kernel(
-    const float* input,
-    const float* weight,
-    const float* bias,
-    float* output,
-    int rows,
-    int offset) {
-  int index = blockIdx.x * blockDim.x + threadIdx.x;
-  int total = rows * D_MODEL;
-  if (index >= total) return;
-  int out = index % D_MODEL;
-  int row = index / D_MODEL;
-  int projected = offset + out;
-  float value = bias[projected];
-  const float* input_row = input + row * D_MODEL;
-  const float* weight_row = weight + projected * D_MODEL;
-  for (int dim = 0; dim < D_MODEL; ++dim) {
-    value += weight_row[dim] * input_row[dim];
-  }
-  output[index] = value;
 }
 
 __global__ void split_qkv_kernel(const float* qkv, float* q, float* k, float* v, int rows) {
@@ -375,6 +541,18 @@ __global__ void split_qkv_kernel(const float* qkv, float* q, float* k, float* v,
   v[index] = source[D_MODEL * 2];
 }
 
+__global__ void split_qkv_bias_kernel(const float* qkv, const float* bias, float* q, float* k, float* v, int rows) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D_MODEL;
+  if (index >= total) return;
+  int row = index / D_MODEL;
+  int dim = index % D_MODEL;
+  const float* source = qkv + row * D_MODEL * 3 + dim;
+  q[index] = source[0] + bias[dim];
+  k[index] = source[D_MODEL] + bias[D_MODEL + dim];
+  v[index] = source[D_MODEL * 2] + bias[D_MODEL * 2 + dim];
+}
+
 __global__ void split_kv_kernel(const float* kv, float* k, float* v, int rows) {
   int index = blockIdx.x * blockDim.x + threadIdx.x;
   int total = rows * D_MODEL;
@@ -384,6 +562,17 @@ __global__ void split_kv_kernel(const float* kv, float* k, float* v, int rows) {
   const float* source = kv + row * D_MODEL * 2 + dim;
   k[index] = source[0];
   v[index] = source[D_MODEL];
+}
+
+__global__ void split_kv_bias_kernel(const float* kv, const float* bias, float* k, float* v, int rows) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * D_MODEL;
+  if (index >= total) return;
+  int row = index / D_MODEL;
+  int dim = index % D_MODEL;
+  const float* source = kv + row * D_MODEL * 2 + dim;
+  k[index] = source[0] + bias[dim];
+  v[index] = source[D_MODEL] + bias[D_MODEL + dim];
 }
 
 __global__ void gelu_kernel(float* values, int count) {
@@ -398,6 +587,20 @@ __global__ void add_kernel(float* left, const float* right, int count) {
   if (index < count) {
     left[index] += right[index];
   }
+}
+
+__global__ void add_bias_gelu_kernel(float* values, const float* bias, int rows, int features) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * features;
+  if (index >= total) return;
+  values[index] = gelu_device(values[index] + bias[index % features]);
+}
+
+__global__ void add_bias_residual_kernel(float* residual, const float* update, const float* bias, int rows, int features) {
+  int index = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = rows * features;
+  if (index >= total) return;
+  residual[index] += update[index] + bias[index % features];
 }
 
 __global__ void attention_kernel(
@@ -488,6 +691,81 @@ int blocks_for(int count) {
   return (count + 255) / 256;
 }
 
+int resident_compact_token_count() {
+  static int cached = 0;
+  if (cached > 0) {
+    return cached;
+  }
+  int fleet_cap = 128;
+  if (const char* value = std::getenv("ORBIT_WARS_V8_TOKEN_FLEET_CAP")) {
+    const int parsed = std::atoi(value);
+    if (parsed > 0) {
+      fleet_cap = parsed;
+    }
+  }
+  fleet_cap = std::max(0, std::min(fleet_cap, MAX_TOKEN_FLEETS));
+  cached = 1 + PLANETS + fleet_cap;
+  return cached;
+}
+
+cudaError_t launch_cutlass_linear(
+    const float* input,
+    const float* weight,
+    const float* bias,
+    float* output,
+    int rows,
+    int in_features,
+    int out_features) {
+  if (rows <= 0 || in_features <= 0 || out_features <= 0) {
+    return cudaSuccess;
+  }
+  if (out_features >= 8) {
+    CutlassLinearGemm gemm_op;
+    CutlassLinearGemm::Arguments arguments(
+        cutlass::gemm::GemmCoord(rows, out_features, in_features),
+        {input, in_features},
+        {weight, in_features},
+        {output, out_features},
+        {output, out_features},
+        {1.0f, 0.0f});
+    cutlass::Status status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorNotSupported;
+    }
+    status = gemm_op.initialize(arguments);
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorUnknown;
+    }
+    status = gemm_op();
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorUnknown;
+    }
+  } else {
+    CutlassLinearGemmSimt gemm_op;
+    CutlassLinearGemmSimt::Arguments arguments(
+        cutlass::gemm::GemmCoord(rows, out_features, in_features),
+        {input, in_features},
+        {weight, in_features},
+        {output, out_features},
+        {output, out_features},
+        {1.0f, 0.0f});
+    cutlass::Status status = gemm_op.can_implement(arguments);
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorNotSupported;
+    }
+    status = gemm_op.initialize(arguments);
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorUnknown;
+    }
+    status = gemm_op();
+    if (status != cutlass::Status::kSuccess) {
+      return cudaErrorUnknown;
+    }
+  }
+  add_linear_bias_kernel<<<blocks_for(rows * out_features), 256>>>(output, bias, rows, out_features);
+  return cudaGetLastError();
+}
+
 cudaError_t launch_linear(
     const float* input,
     const float* weight,
@@ -496,30 +774,123 @@ cudaError_t launch_linear(
     int rows,
     int in_features,
     int out_features) {
-  cudaError_t error = ensure_cublas_handle();
-  if (error != cudaSuccess) return error;
-  const float alpha = 1.0f;
-  const float beta = 0.0f;
-  cublasStatus_t status = cublasSgemm(
-      g_cublas_handle,
-      CUBLAS_OP_T,
-      CUBLAS_OP_N,
-      out_features,
-      rows,
-      in_features,
-      &alpha,
-      weight,
-      in_features,
-      input,
-      in_features,
-      &beta,
-      output,
-      out_features);
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    return cudaErrorUnknown;
+  return launch_cutlass_linear(input, weight, bias, output, rows, in_features, out_features);
+}
+
+cudaError_t launch_grouped_cutlass_linear(
+    CudaSimState* sim_state,
+    const std::vector<const float*>& inputs,
+    const std::vector<const float*>& weights,
+    const std::vector<float*>& outputs,
+    const std::vector<int>& rows,
+    int in_features,
+    int out_features) {
+  const int problem_count = static_cast<int>(inputs.size());
+  if (problem_count == 0) return cudaSuccess;
+  if (!sim_state || weights.size() != inputs.size() || outputs.size() != inputs.size() ||
+      rows.size() != inputs.size()) {
+    return cudaErrorInvalidValue;
   }
-  add_linear_bias_kernel<<<blocks_for(rows * out_features), 256>>>(output, bias, rows, out_features);
-  return cudaGetLastError();
+  std::vector<cutlass::gemm::GemmCoord> host_problem_sizes;
+  std::vector<float*> host_ptr_a;
+  std::vector<float*> host_ptr_b;
+  std::vector<float*> host_ptr_c;
+  std::vector<float*> host_ptr_d;
+  std::vector<int64_t> host_lda;
+  std::vector<int64_t> host_ldb;
+  std::vector<int64_t> host_ldc;
+  std::vector<int64_t> host_ldd;
+  host_problem_sizes.reserve(problem_count);
+  host_ptr_a.reserve(problem_count);
+  host_ptr_b.reserve(problem_count);
+  host_ptr_c.reserve(problem_count);
+  host_ptr_d.reserve(problem_count);
+  host_lda.reserve(problem_count);
+  host_ldb.reserve(problem_count);
+  host_ldc.reserve(problem_count);
+  host_ldd.reserve(problem_count);
+  for (int index = 0; index < problem_count; ++index) {
+    if (rows[index] <= 0) continue;
+    host_problem_sizes.emplace_back(rows[index], out_features, in_features);
+    host_ptr_a.push_back(const_cast<float*>(inputs[index]));
+    host_ptr_b.push_back(const_cast<float*>(weights[index]));
+    host_ptr_c.push_back(outputs[index]);
+    host_ptr_d.push_back(outputs[index]);
+    host_lda.push_back(in_features);
+    host_ldb.push_back(in_features);
+    host_ldc.push_back(out_features);
+    host_ldd.push_back(out_features);
+  }
+  const int active_count = static_cast<int>(host_problem_sizes.size());
+  if (active_count == 0) return cudaSuccess;
+  cudaError_t error = cudaSuccess;
+#define ENSURE_GROUPED(buffer, count) \
+  do { error = (buffer).ensure(count); if (error != cudaSuccess) return error; } while (0)
+  ENSURE_GROUPED(sim_state->grouped_problem_sizes, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ptr_a, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ptr_b, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ptr_c, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ptr_d, active_count);
+  ENSURE_GROUPED(sim_state->grouped_lda, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ldb, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ldc, active_count);
+  ENSURE_GROUPED(sim_state->grouped_ldd, active_count);
+#undef ENSURE_GROUPED
+  error = sim_state->grouped_problem_sizes.copy_from_host(host_problem_sizes.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ptr_a.copy_from_host(host_ptr_a.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ptr_b.copy_from_host(host_ptr_b.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ptr_c.copy_from_host(host_ptr_c.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ptr_d.copy_from_host(host_ptr_d.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_lda.copy_from_host(host_lda.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ldb.copy_from_host(host_ldb.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ldc.copy_from_host(host_ldc.data(), active_count);
+  if (error != cudaSuccess) return error;
+  error = sim_state->grouped_ldd.copy_from_host(host_ldd.data(), active_count);
+  if (error != cudaSuccess) return error;
+
+  CutlassGroupedLinearGemm gemm_op;
+  int threadblock_count = CutlassGroupedLinearGemm::sufficient(host_problem_sizes.data(), active_count);
+  if (threadblock_count <= 0) {
+    std::fprintf(stderr, "grouped_cutlass_unsupported=sufficient active=%d in=%d out=%d\n",
+                 active_count, in_features, out_features);
+    std::fflush(stderr);
+    return cudaErrorNotSupported;
+  }
+  CutlassGroupedLinearGemm::Arguments arguments(
+      sim_state->grouped_problem_sizes.ptr,
+      active_count,
+      threadblock_count,
+      CutlassGroupedLinearOutputOp::Params(1.0f, 0.0f),
+      sim_state->grouped_ptr_a.ptr,
+      sim_state->grouped_ptr_b.ptr,
+      sim_state->grouped_ptr_c.ptr,
+      sim_state->grouped_ptr_d.ptr,
+      sim_state->grouped_lda.ptr,
+      sim_state->grouped_ldb.ptr,
+      sim_state->grouped_ldc.ptr,
+      sim_state->grouped_ldd.ptr,
+      host_problem_sizes.data());
+  cutlass::Status status = gemm_op.can_implement(arguments);
+  if (status != cutlass::Status::kSuccess) return cudaErrorNotSupported;
+  size_t workspace_size = CutlassGroupedLinearGemm::get_workspace_size(arguments);
+  if (workspace_size > 0) {
+    error = sim_state->grouped_workspace.ensure(workspace_size);
+    if (error != cudaSuccess) return error;
+  }
+  status = gemm_op.initialize(arguments, sim_state->grouped_workspace.ptr);
+  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  status = gemm_op();
+  if (status != cutlass::Status::kSuccess) return cudaErrorUnknown;
+  error = cudaGetLastError();
+  if (error != cudaSuccess) return error;
+  return cudaSuccess;
 }
 
 cudaError_t launch_qkv(
@@ -747,6 +1118,373 @@ cudaError_t decoder_layer(
   return cudaGetLastError();
 }
 
+cudaError_t grouped_encoder_layer(
+    CudaSimState* sim_state,
+    const std::vector<CudaModelState*>& models,
+    const std::vector<int>& counts,
+    int layer,
+    int token_count) {
+  if (models.empty()) return cudaSuccess;
+  std::vector<const float*> inputs;
+  std::vector<const float*> weights;
+  std::vector<const float*> biases;
+  std::vector<float*> outputs;
+  std::vector<int> rows;
+  inputs.reserve(models.size());
+  weights.reserve(models.size());
+  biases.reserve(models.size());
+  outputs.reserve(models.size());
+  rows.reserve(models.size());
+  auto reset = [&]() {
+    inputs.clear();
+    weights.clear();
+    biases.clear();
+    outputs.clear();
+    rows.clear();
+  };
+  cudaError_t error = cudaSuccess;
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    const int row_count = counts[index] * token_count;
+    layer_norm_kernel<<<blocks_for(row_count), 256>>>(
+        workspace.hidden.ptr, layer_weights.norm1_weight, layer_weights.norm1_bias, workspace.norm_token.ptr, row_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    inputs.push_back(workspace.norm_token.ptr);
+    weights.push_back(layer_weights.self_attn_in_proj_weight);
+    biases.push_back(layer_weights.self_attn_in_proj_bias);
+    outputs.push_back(workspace.token_qkv.ptr);
+    rows.push_back(row_count);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL * 3);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    ForwardWorkspace& workspace = models[index]->workspace;
+    const EncoderLayerWeights& layer_weights = models[index]->weights.encoder[layer];
+    const int row_count = counts[index] * token_count;
+    split_qkv_bias_kernel<<<blocks_for(row_count * D_MODEL), 256>>>(
+        workspace.token_qkv.ptr, layer_weights.self_attn_in_proj_bias, workspace.token_q.ptr, workspace.token_k.ptr, workspace.token_v.ptr, row_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    attention_kernel<<<blocks_for(counts[index] * token_count * HEADS), 256>>>(
+        workspace.token_q.ptr,
+        workspace.token_k.ptr,
+        workspace.token_v.ptr,
+        workspace.d_padding_mask.ptr,
+        workspace.token_context.ptr,
+        counts[index],
+        token_count,
+        token_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    inputs.push_back(workspace.token_context.ptr);
+    weights.push_back(layer_weights.self_attn_out_proj_weight);
+    biases.push_back(layer_weights.self_attn_out_proj_bias);
+    outputs.push_back(workspace.token_attn.ptr);
+    rows.push_back(counts[index] * token_count);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    const int element_count = counts[index] * token_count * D_MODEL;
+    add_bias_residual_kernel<<<blocks_for(element_count), 256>>>(
+        workspace.hidden.ptr, workspace.token_attn.ptr, layer_weights.self_attn_out_proj_bias, counts[index] * token_count, D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    const int row_count = counts[index] * token_count;
+    layer_norm_kernel<<<blocks_for(row_count), 256>>>(
+        workspace.hidden.ptr, layer_weights.norm2_weight, layer_weights.norm2_bias, workspace.norm_token.ptr, row_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    inputs.push_back(workspace.norm_token.ptr);
+    weights.push_back(layer_weights.linear1_weight);
+    biases.push_back(layer_weights.linear1_bias);
+    outputs.push_back(workspace.token_ff_mid.ptr);
+    rows.push_back(row_count);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, FF_DIM);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const EncoderLayerWeights& layer_weights = models[index]->weights.encoder[layer];
+    const int element_count = counts[index] * token_count * FF_DIM;
+    add_bias_gelu_kernel<<<blocks_for(element_count), 256>>>(
+        models[index]->workspace.token_ff_mid.ptr, layer_weights.linear1_bias, counts[index] * token_count, FF_DIM);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    inputs.push_back(workspace.token_ff_mid.ptr);
+    weights.push_back(layer_weights.linear2_weight);
+    biases.push_back(layer_weights.linear2_bias);
+    outputs.push_back(workspace.token_ff_out.ptr);
+    rows.push_back(counts[index] * token_count);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, FF_DIM, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const EncoderLayerWeights& layer_weights = model->weights.encoder[layer];
+    const int element_count = counts[index] * token_count * D_MODEL;
+    add_bias_residual_kernel<<<blocks_for(element_count), 256>>>(
+        workspace.hidden.ptr, workspace.token_ff_out.ptr, layer_weights.linear2_bias, counts[index] * token_count, D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  return cudaSuccess;
+}
+
+cudaError_t grouped_decoder_layer(
+    CudaSimState* sim_state,
+    const std::vector<CudaModelState*>& models,
+    const std::vector<int>& counts,
+    int layer,
+    int token_count) {
+  if (models.empty()) return cudaSuccess;
+  std::vector<const float*> inputs;
+  std::vector<const float*> weights;
+  std::vector<const float*> biases;
+  std::vector<float*> outputs;
+  std::vector<int> rows;
+  inputs.reserve(models.size());
+  weights.reserve(models.size());
+  biases.reserve(models.size());
+  outputs.reserve(models.size());
+  rows.reserve(models.size());
+  auto reset = [&]() {
+    inputs.clear();
+    weights.clear();
+    biases.clear();
+    outputs.clear();
+    rows.clear();
+  };
+  cudaError_t error = cudaSuccess;
+
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    const int slot_rows = counts[index] * ACTION_SLOTS;
+    layer_norm_kernel<<<blocks_for(slot_rows), 256>>>(
+        workspace.slots.ptr, layer_weights.norm1_weight, layer_weights.norm1_bias, workspace.norm_slot.ptr, slot_rows);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    inputs.push_back(workspace.norm_slot.ptr);
+    weights.push_back(layer_weights.self_attn_in_proj_weight);
+    biases.push_back(layer_weights.self_attn_in_proj_bias);
+    outputs.push_back(workspace.slot_qkv.ptr);
+    rows.push_back(slot_rows);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL * 3);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    ForwardWorkspace& workspace = models[index]->workspace;
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int slot_rows = counts[index] * ACTION_SLOTS;
+    split_qkv_bias_kernel<<<blocks_for(slot_rows * D_MODEL), 256>>>(
+        workspace.slot_qkv.ptr, layer_weights.self_attn_in_proj_bias, workspace.slot_q.ptr, workspace.slot_k.ptr, workspace.slot_v.ptr, slot_rows);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    attention_kernel<<<blocks_for(counts[index] * ACTION_SLOTS * HEADS), 256>>>(
+        workspace.slot_q.ptr,
+        workspace.slot_k.ptr,
+        workspace.slot_v.ptr,
+        nullptr,
+        workspace.slot_context.ptr,
+        counts[index],
+        ACTION_SLOTS,
+        ACTION_SLOTS);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    inputs.push_back(workspace.slot_context.ptr);
+    weights.push_back(layer_weights.self_attn_out_proj_weight);
+    biases.push_back(layer_weights.self_attn_out_proj_bias);
+    outputs.push_back(workspace.slot_attn.ptr);
+    rows.push_back(counts[index] * ACTION_SLOTS);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int element_count = counts[index] * ACTION_SLOTS * D_MODEL;
+    add_bias_residual_kernel<<<blocks_for(element_count), 256>>>(
+        models[index]->workspace.slots.ptr,
+        models[index]->workspace.slot_attn.ptr,
+        layer_weights.self_attn_out_proj_bias,
+        counts[index] * ACTION_SLOTS,
+        D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    const int slot_rows = counts[index] * ACTION_SLOTS;
+    layer_norm_kernel<<<blocks_for(slot_rows), 256>>>(
+        workspace.slots.ptr, layer_weights.norm2_weight, layer_weights.norm2_bias, workspace.norm_slot.ptr, slot_rows);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    inputs.push_back(workspace.norm_slot.ptr);
+    weights.push_back(layer_weights.cross_attn_in_proj_weight);
+    biases.push_back(layer_weights.cross_attn_in_proj_bias);
+    outputs.push_back(workspace.slot_q.ptr);
+    rows.push_back(slot_rows);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int slot_rows = counts[index] * ACTION_SLOTS;
+    add_linear_bias_kernel<<<blocks_for(slot_rows * D_MODEL), 256>>>(
+        models[index]->workspace.slot_q.ptr, layer_weights.cross_attn_in_proj_bias, slot_rows, D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    inputs.push_back(workspace.hidden.ptr);
+    weights.push_back(layer_weights.cross_attn_in_proj_weight + static_cast<size_t>(D_MODEL) * D_MODEL);
+    biases.push_back(layer_weights.cross_attn_in_proj_bias + D_MODEL);
+    outputs.push_back(workspace.slot_qkv.ptr);
+    rows.push_back(counts[index] * token_count);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL * 2);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    ForwardWorkspace& workspace = models[index]->workspace;
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int token_rows = counts[index] * token_count;
+    split_kv_bias_kernel<<<blocks_for(token_rows * D_MODEL), 256>>>(
+        workspace.slot_qkv.ptr, layer_weights.cross_attn_in_proj_bias + D_MODEL, workspace.slot_k.ptr, workspace.slot_v.ptr, token_rows);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    attention_kernel<<<blocks_for(counts[index] * ACTION_SLOTS * HEADS), 256>>>(
+        workspace.slot_q.ptr,
+        workspace.slot_k.ptr,
+        workspace.slot_v.ptr,
+        workspace.d_padding_mask.ptr,
+        workspace.slot_context.ptr,
+        counts[index],
+        ACTION_SLOTS,
+        token_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    inputs.push_back(workspace.slot_context.ptr);
+    weights.push_back(layer_weights.cross_attn_out_proj_weight);
+    biases.push_back(layer_weights.cross_attn_out_proj_bias);
+    outputs.push_back(workspace.slot_attn.ptr);
+    rows.push_back(counts[index] * ACTION_SLOTS);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int element_count = counts[index] * ACTION_SLOTS * D_MODEL;
+    add_bias_residual_kernel<<<blocks_for(element_count), 256>>>(
+        models[index]->workspace.slots.ptr,
+        models[index]->workspace.slot_attn.ptr,
+        layer_weights.cross_attn_out_proj_bias,
+        counts[index] * ACTION_SLOTS,
+        D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    const int slot_rows = counts[index] * ACTION_SLOTS;
+    layer_norm_kernel<<<blocks_for(slot_rows), 256>>>(
+        workspace.slots.ptr, layer_weights.norm3_weight, layer_weights.norm3_bias, workspace.norm_slot.ptr, slot_rows);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+    inputs.push_back(workspace.norm_slot.ptr);
+    weights.push_back(layer_weights.linear1_weight);
+    biases.push_back(layer_weights.linear1_bias);
+    outputs.push_back(workspace.slot_ff_mid.ptr);
+    rows.push_back(slot_rows);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, D_MODEL, FF_DIM);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int element_count = counts[index] * ACTION_SLOTS * FF_DIM;
+    add_bias_gelu_kernel<<<blocks_for(element_count), 256>>>(
+        models[index]->workspace.slot_ff_mid.ptr, layer_weights.linear1_bias, counts[index] * ACTION_SLOTS, FF_DIM);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  reset();
+  for (size_t index = 0; index < models.size(); ++index) {
+    CudaModelState* model = models[index];
+    ForwardWorkspace& workspace = model->workspace;
+    const DecoderLayerWeights& layer_weights = model->weights.decoder[layer];
+    inputs.push_back(workspace.slot_ff_mid.ptr);
+    weights.push_back(layer_weights.linear2_weight);
+    biases.push_back(layer_weights.linear2_bias);
+    outputs.push_back(workspace.slot_ff_out.ptr);
+    rows.push_back(counts[index] * ACTION_SLOTS);
+  }
+  error = launch_grouped_cutlass_linear(sim_state, inputs, weights, outputs, rows, FF_DIM, D_MODEL);
+  if (error != cudaSuccess) return error;
+  for (size_t index = 0; index < models.size(); ++index) {
+    const DecoderLayerWeights& layer_weights = models[index]->weights.decoder[layer];
+    const int element_count = counts[index] * ACTION_SLOTS * D_MODEL;
+    add_bias_residual_kernel<<<blocks_for(element_count), 256>>>(
+        models[index]->workspace.slots.ptr,
+        models[index]->workspace.slot_ff_out.ptr,
+        layer_weights.linear2_bias,
+        counts[index] * ACTION_SLOTS,
+        D_MODEL);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return error;
+  }
+  return cudaSuccess;
+}
+
 OrbitWarsV8CudaStatus forward_with_tensor_map(
     const TensorMap& tensor_map,
     const float* tokens,
@@ -931,7 +1669,8 @@ OrbitWarsV8CudaStatus forward_with_tensor_map(
 OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
     const TensorMap& tensor_map,
     ForwardWorkspace& workspace,
-    OrbitWarsV8CudaShape shape) {
+    OrbitWarsV8CudaShape shape,
+    bool compute_heads = true) {
   const int batch_count = static_cast<int>(shape.batch_count);
   const int token_count = static_cast<int>(shape.token_count);
   const int token_rows = batch_count * token_count;
@@ -1027,6 +1766,9 @@ OrbitWarsV8CudaStatus forward_workspace_with_tensor_map(
         batch_count,
         token_count);
     if (error != cudaSuccess) return cuda_error(error);
+  }
+  if (!compute_heads) {
+    return ok();
   }
   const float* fire_weight = tensor_ptr(tensor_map, "fire_head.weight");
   const float* fire_bias = tensor_ptr(tensor_map, "fire_head.bias");
@@ -1215,15 +1957,28 @@ __global__ void resident_decode_actions_kernel(
     const float* fire_logits,
     const float* source_logits,
     const float* target_logits,
-    const float* amount_logits) {
+    const float* amount_logits,
+    OrbitWarsCudaActionLabel* labels) {
   const int request = blockIdx.x * blockDim.x + threadIdx.x;
   if (request >= request_count) return;
   const int game = request_game_indices[request];
   const int player = request_player_ids[request];
-  if (sim.statuses && sim.statuses[game].done) return;
   OrbitWarsCudaPlanet* planets = sim.planets + static_cast<size_t>(game) * sim.config.planet_count;
   OrbitWarsCudaAction* actions = sim.actions + (static_cast<size_t>(game) * sim.config.max_players + player) * sim.config.max_actions_per_player;
   int* action_count = sim.action_counts + game * sim.config.max_players + player;
+  *action_count = 0;
+  OrbitWarsCudaActionLabel label{};
+  for (int index = 0; index < ACTION_SLOTS; ++index) {
+    label.source_row[index] = -1;
+    label.target_row[index] = -1;
+    label.amount_class[index] = -1;
+    label.source_planet_id[index] = -1;
+    label.target_planet_id[index] = -1;
+  }
+  if (labels) {
+    labels[request] = label;
+  }
+  if (sim.statuses && sim.statuses[game].done) return;
   bool used_sources[PLANETS];
   for (int index = 0; index < PLANETS; ++index) used_sources[index] = false;
   bool used_slots[ACTION_SLOTS];
@@ -1258,6 +2013,14 @@ __global__ void resident_decode_actions_kernel(
     if (amount_index < 0) continue;
     const int ships = resident_amount_ships(amount_index, source.ships);
     if (ships < 1) continue;
+    label.fire[written] = 1;
+    label.source_row[written] = source_row;
+    label.target_row[written] = target_row;
+    label.amount_class[written] = amount_index;
+    label.source_planet_id[written] = source.id;
+    label.target_planet_id[written] = target.id;
+    label.ship_count[written] = ships;
+    label.confidence[written] = best_fire;
     actions[written] = OrbitWarsCudaAction{
         source.id,
         atan2f(target.y - source.y, target.x - source.x),
@@ -1266,6 +2029,9 @@ __global__ void resident_decode_actions_kernel(
     written += 1;
   }
   *action_count = written;
+  if (labels) {
+    labels[request] = label;
+  }
 }
 
 __device__ bool sim_segment_intersects_sun(
@@ -1992,6 +2758,7 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_create(
   }
   auto state = std::make_unique<CudaSimState>();
   state->config = config;
+  state->resident_token_count = std::max(1 + PLANETS, std::min(resident_compact_token_count(), RESIDENT_TOKEN_COUNT));
   cudaError_t error = sim_allocate_state(state.get());
   if (error != cudaSuccess) {
     return cuda_error(error);
@@ -2100,6 +2867,29 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_clear_actions(
   return ok();
 }
 
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_load_request_plan(
+    OrbitWarsCudaSimState* opaque,
+    const int* request_game_indices,
+    const int* request_player_ids,
+    size_t request_count) {
+  if (!opaque || (!request_game_indices && request_count > 0) || (!request_player_ids && request_count > 0)) {
+    return bad_argument("null request plan argument");
+  }
+  auto* state = reinterpret_cast<CudaSimState*>(opaque);
+  cudaError_t error = state->request_game_indices.ensure(request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = state->request_player_ids.ensure(request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  if (request_count > 0) {
+    error = state->request_game_indices.copy_from_host(request_game_indices, request_count);
+    if (error != cudaSuccess) return cuda_error(error);
+    error = state->request_player_ids.copy_from_host(request_player_ids, request_count);
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  state->request_plan_count = request_count;
+  return ok();
+}
+
 extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_device_actions(
     OrbitWarsCudaSimState* opaque,
     int step) {
@@ -2138,16 +2928,14 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_device_actions(
   return ok();
 }
 
-extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
-    OrbitWarsV8CudaModel* model,
-    OrbitWarsCudaSimState* opaque,
-    const int* request_game_indices,
-    const int* request_player_ids,
+OrbitWarsV8CudaStatus resident_model_decode_device(
+    CudaModelState* model_state,
+    CudaSimState* sim_state,
+    int* request_game_indices_device,
+    int* request_player_ids_device,
     size_t request_count,
     int step) {
-  auto* model_state = reinterpret_cast<CudaModelState*>(model);
-  auto* sim_state = reinterpret_cast<CudaSimState*>(opaque);
-  if (!model_state || !sim_state || !request_game_indices || !request_player_ids) {
+  if (!model_state || !sim_state || !request_game_indices_device || !request_player_ids_device) {
     return bad_argument("null resident decode argument");
   }
   if (request_count == 0) {
@@ -2157,24 +2945,20 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
   cudaError_t error = cudaSuccess;
 #define ENSURE(buffer, count) \
   do { error = (buffer).ensure(count); if (error != cudaSuccess) return cuda_error(error); } while (0)
-  ENSURE(workspace.request_game_indices, request_count);
-  ENSURE(workspace.request_player_ids, request_count);
   ENSURE(workspace.d_tokens, request_count * RESIDENT_TOKEN_COUNT * TOKEN_FEATURES);
   ENSURE(workspace.d_token_type_ids, request_count * RESIDENT_TOKEN_COUNT);
   ENSURE(workspace.d_owner_ids, request_count * RESIDENT_TOKEN_COUNT);
   ENSURE(workspace.d_padding_mask, request_count * RESIDENT_TOKEN_COUNT);
   ENSURE(workspace.d_planet_mask, request_count * PLANETS);
+  ENSURE(workspace.d_action_labels, request_count);
 #undef ENSURE
-  error = workspace.request_game_indices.copy_from_host(request_game_indices, request_count);
-  if (error != cudaSuccess) return cuda_error(error);
-  error = workspace.request_player_ids.copy_from_host(request_player_ids, request_count);
-  if (error != cudaSuccess) return cuda_error(error);
+  workspace.last_request_count = request_count;
   CudaSimKernelState kernel_state = sim_kernel_state(sim_state);
   kernel_state.config.step = step;
   resident_build_tokens_kernel<<<blocks_for(static_cast<int>(request_count * RESIDENT_TOKEN_COUNT)), 256>>>(
       kernel_state,
-      workspace.request_game_indices.ptr,
-      workspace.request_player_ids.ptr,
+      request_game_indices_device,
+      request_player_ids_device,
       static_cast<int>(request_count),
       step,
       workspace.d_tokens.ptr,
@@ -2201,16 +2985,50 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
   }
   resident_decode_actions_kernel<<<blocks_for(static_cast<int>(request_count)), 256>>>(
       kernel_state,
-      workspace.request_game_indices.ptr,
-      workspace.request_player_ids.ptr,
+      request_game_indices_device,
+      request_player_ids_device,
       static_cast<int>(request_count),
       workspace.d_fire.ptr,
       workspace.d_source.ptr,
       workspace.d_target.ptr,
-      workspace.d_amount.ptr);
+      workspace.d_amount.ptr,
+      workspace.d_action_labels.ptr);
   error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_model_decode(
+    OrbitWarsV8CudaModel* model,
+    OrbitWarsCudaSimState* opaque,
+    const int* request_game_indices,
+    const int* request_player_ids,
+    size_t request_count,
+    int step) {
+  auto* model_state = reinterpret_cast<CudaModelState*>(model);
+  auto* sim_state = reinterpret_cast<CudaSimState*>(opaque);
+  if (!model_state || !sim_state || !request_game_indices || !request_player_ids) {
+    return bad_argument("null resident decode argument");
+  }
+  if (request_count == 0) {
+    return ok();
+  }
+  ForwardWorkspace& workspace = model_state->workspace;
+  cudaError_t error = workspace.request_game_indices.ensure(request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.request_player_ids.ensure(request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.request_game_indices.copy_from_host(request_game_indices, request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.request_player_ids.copy_from_host(request_player_ids, request_count);
+  if (error != cudaSuccess) return cuda_error(error);
+  return resident_model_decode_device(
+      model_state,
+      sim_state,
+      workspace.request_game_indices.ptr,
+      workspace.request_player_ids.ptr,
+      request_count,
+      step);
 }
 
 extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode(
@@ -2250,6 +3068,374 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode(
       return status;
     }
   }
+  return ok();
+}
+
+OrbitWarsV8CudaStatus resident_models_decode_plan_impl(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* opaque,
+    const int* request_offsets,
+    const int* request_counts,
+    size_t request_total,
+    int step,
+    bool force_full_tokens) {
+  if (!models || !opaque || !request_offsets || !request_counts) {
+    return bad_argument("null resident models decode plan argument");
+  }
+  auto* sim_state = reinterpret_cast<CudaSimState*>(opaque);
+  if (request_total > sim_state->request_plan_count) {
+    return bad_argument("resident request plan range out of bounds");
+  }
+  const int resident_token_count = force_full_tokens ? RESIDENT_TOKEN_COUNT : sim_state->resident_token_count;
+  std::vector<CudaModelState*> active_models;
+  std::vector<int> active_offsets;
+  std::vector<int> active_counts;
+  active_models.reserve(model_count);
+  active_offsets.reserve(model_count);
+  active_counts.reserve(model_count);
+  for (size_t model_index = 0; model_index < model_count; ++model_index) {
+    auto* model_state = reinterpret_cast<CudaModelState*>(models[model_index]);
+    if (!model_state) {
+      return bad_argument("null resident model entry");
+    }
+    const int offset = request_offsets[model_index];
+    const int count = request_counts[model_index];
+    if (offset < 0 || count < 0 || static_cast<size_t>(offset + count) > request_total) {
+      return bad_argument("resident models request plan range out of bounds");
+    }
+    if (count == 0) {
+      continue;
+    }
+    ForwardWorkspace& workspace = model_state->workspace;
+    cudaError_t error = cudaSuccess;
+#define ENSURE_RESIDENT(buffer, element_count) \
+    do { error = (buffer).ensure(element_count); if (error != cudaSuccess) return cuda_error(error); } while (0)
+    ENSURE_RESIDENT(workspace.d_tokens, static_cast<size_t>(count) * RESIDENT_TOKEN_COUNT * TOKEN_FEATURES);
+    ENSURE_RESIDENT(workspace.d_token_type_ids, static_cast<size_t>(count) * RESIDENT_TOKEN_COUNT);
+    ENSURE_RESIDENT(workspace.d_owner_ids, static_cast<size_t>(count) * RESIDENT_TOKEN_COUNT);
+    ENSURE_RESIDENT(workspace.d_padding_mask, static_cast<size_t>(count) * RESIDENT_TOKEN_COUNT);
+    ENSURE_RESIDENT(workspace.d_planet_mask, static_cast<size_t>(count) * PLANETS);
+    ENSURE_RESIDENT(workspace.d_action_labels, static_cast<size_t>(count));
+#undef ENSURE_RESIDENT
+    workspace.last_request_count = static_cast<size_t>(count);
+    workspace.last_token_count = static_cast<size_t>(resident_token_count);
+    const int token_rows = count * resident_token_count;
+    const int slot_rows = count * ACTION_SLOTS;
+#define ENSURE_RESIDENT_BODY(buffer, element_count) \
+    do { error = (buffer).ensure(element_count); if (error != cudaSuccess) return cuda_error(error); } while (0)
+    ENSURE_RESIDENT_BODY(workspace.hidden, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.norm_token, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_attn, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_q, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_k, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_v, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_qkv, static_cast<size_t>(token_rows) * D_MODEL * 3);
+    ENSURE_RESIDENT_BODY(workspace.token_context, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.token_ff_mid, static_cast<size_t>(token_rows) * FF_DIM);
+    ENSURE_RESIDENT_BODY(workspace.token_ff_out, static_cast<size_t>(token_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slots, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.norm_slot, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_attn, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_q, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_k, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_v, static_cast<size_t>(std::max(token_rows, slot_rows)) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_qkv, static_cast<size_t>(std::max(token_rows * 2, slot_rows * 3)) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_context, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.slot_ff_mid, static_cast<size_t>(slot_rows) * FF_DIM);
+    ENSURE_RESIDENT_BODY(workspace.slot_ff_out, static_cast<size_t>(slot_rows) * D_MODEL);
+    ENSURE_RESIDENT_BODY(workspace.d_fire, static_cast<size_t>(slot_rows));
+    ENSURE_RESIDENT_BODY(workspace.d_source, static_cast<size_t>(slot_rows) * PLANETS);
+    ENSURE_RESIDENT_BODY(workspace.d_target, static_cast<size_t>(slot_rows) * PLANETS);
+    ENSURE_RESIDENT_BODY(workspace.d_amount, static_cast<size_t>(slot_rows) * AMOUNTS);
+#undef ENSURE_RESIDENT_BODY
+    CudaSimKernelState kernel_state = sim_kernel_state(sim_state);
+    kernel_state.config.step = step;
+    resident_build_tokens_kernel<<<blocks_for(count * resident_token_count), 256>>>(
+        kernel_state,
+        sim_state->request_game_indices.ptr + offset,
+        sim_state->request_player_ids.ptr + offset,
+        count,
+        step,
+        workspace.d_tokens.ptr,
+        workspace.d_token_type_ids.ptr,
+        workspace.d_owner_ids.ptr,
+        workspace.d_padding_mask.ptr,
+        workspace.d_planet_mask.ptr);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+    const PackedModelWeights& weights = model_state->weights;
+    if (!weights.valid) return bad_argument("invalid packed resident model weights");
+    if (!weights.token_projection_weight || !weights.token_projection_bias || !weights.type_embedding || !weights.owner_embedding) {
+      return bad_argument("missing grouped body token projection tensor");
+    }
+    token_projection_kernel<<<blocks_for(token_rows * D_MODEL), 256>>>(
+        workspace.d_tokens.ptr,
+        workspace.d_token_type_ids.ptr,
+        workspace.d_owner_ids.ptr,
+        weights.token_projection_weight,
+        weights.token_projection_bias,
+        weights.type_embedding,
+        weights.owner_embedding,
+        workspace.hidden.ptr,
+        count,
+        resident_token_count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+    active_models.push_back(model_state);
+    active_offsets.push_back(offset);
+    active_counts.push_back(count);
+  }
+  cudaError_t error = cudaSuccess;
+  for (int layer = 0; layer < ENCODER_LAYERS; ++layer) {
+    error = grouped_encoder_layer(sim_state, active_models, active_counts, layer, resident_token_count);
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  for (size_t index = 0; index < active_models.size(); ++index) {
+    ForwardWorkspace& workspace = active_models[index]->workspace;
+    const float* slot_queries = active_models[index]->weights.slot_queries;
+    if (!slot_queries) return bad_argument("missing grouped body slot query tensor");
+    const int slot_rows = active_counts[index] * ACTION_SLOTS;
+    copy_slot_queries_kernel<<<blocks_for(slot_rows * D_MODEL), 256>>>(
+        slot_queries,
+        workspace.slots.ptr,
+        active_counts[index]);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  for (int layer = 0; layer < DECODER_LAYERS; ++layer) {
+    error = grouped_decoder_layer(sim_state, active_models, active_counts, layer, resident_token_count);
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  std::vector<const float*> head_inputs;
+  std::vector<const float*> head_weights;
+  std::vector<const float*> head_biases;
+  std::vector<float*> head_outputs;
+  std::vector<int> head_rows;
+  auto prepare_grouped_head = [&](const char* weight_name, const char* bias_name, auto output_ptr) -> OrbitWarsV8CudaStatus {
+    head_inputs.clear();
+    head_weights.clear();
+    head_biases.clear();
+    head_outputs.clear();
+    head_rows.clear();
+    for (size_t index = 0; index < active_models.size(); ++index) {
+      const PackedModelWeights& packed = active_models[index]->weights;
+      const float* weight = nullptr;
+      const float* bias = nullptr;
+      if (std::strcmp(weight_name, "source_head.weight") == 0) {
+        weight = packed.source_head_weight;
+        bias = packed.source_head_bias;
+      } else if (std::strcmp(weight_name, "target_head.weight") == 0) {
+        weight = packed.target_head_weight;
+        bias = packed.target_head_bias;
+      } else if (std::strcmp(weight_name, "amount_head.weight") == 0) {
+        weight = packed.amount_head_weight;
+        bias = packed.amount_head_bias;
+      }
+      if (!weight || !bias) return bad_argument("missing grouped head tensor");
+      head_inputs.push_back(active_models[index]->workspace.slots.ptr);
+      head_weights.push_back(weight);
+      head_biases.push_back(bias);
+      head_outputs.push_back(output_ptr(active_models[index]->workspace));
+      head_rows.push_back(active_counts[index] * ACTION_SLOTS);
+    }
+    return ok();
+  };
+  OrbitWarsV8CudaStatus grouped_status = prepare_grouped_head(
+      "source_head.weight",
+      "source_head.bias",
+      [](ForwardWorkspace& workspace) { return workspace.d_source.ptr; });
+  if (grouped_status.code != CUDA_STATUS_OK) return grouped_status;
+  error = launch_grouped_cutlass_linear(sim_state, head_inputs, head_weights, head_outputs, head_rows, D_MODEL, PLANETS);
+  if (error != cudaSuccess) return cuda_error(error);
+  for (size_t index = 0; index < active_models.size(); ++index) {
+    add_linear_bias_kernel<<<blocks_for(head_rows[index] * PLANETS), 256>>>(
+        active_models[index]->workspace.d_source.ptr,
+        head_biases[index],
+        head_rows[index],
+        PLANETS);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  grouped_status = prepare_grouped_head(
+      "target_head.weight",
+      "target_head.bias",
+      [](ForwardWorkspace& workspace) { return workspace.d_target.ptr; });
+  if (grouped_status.code != CUDA_STATUS_OK) return grouped_status;
+  error = launch_grouped_cutlass_linear(sim_state, head_inputs, head_weights, head_outputs, head_rows, D_MODEL, PLANETS);
+  if (error != cudaSuccess) return cuda_error(error);
+  for (size_t index = 0; index < active_models.size(); ++index) {
+    add_linear_bias_kernel<<<blocks_for(head_rows[index] * PLANETS), 256>>>(
+        active_models[index]->workspace.d_target.ptr,
+        head_biases[index],
+        head_rows[index],
+        PLANETS);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  grouped_status = prepare_grouped_head(
+      "amount_head.weight",
+      "amount_head.bias",
+      [](ForwardWorkspace& workspace) { return workspace.d_amount.ptr; });
+  if (grouped_status.code != CUDA_STATUS_OK) return grouped_status;
+  error = launch_grouped_cutlass_linear(sim_state, head_inputs, head_weights, head_outputs, head_rows, D_MODEL, AMOUNTS);
+  if (error != cudaSuccess) return cuda_error(error);
+  for (size_t index = 0; index < active_models.size(); ++index) {
+    add_linear_bias_kernel<<<blocks_for(head_rows[index] * AMOUNTS), 256>>>(
+        active_models[index]->workspace.d_amount.ptr,
+        head_biases[index],
+        head_rows[index],
+        AMOUNTS);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  for (size_t index = 0; index < active_models.size(); ++index) {
+    ForwardWorkspace& workspace = active_models[index]->workspace;
+    const float* fire_weight = active_models[index]->weights.fire_head_weight;
+    const float* fire_bias = active_models[index]->weights.fire_head_bias;
+    if (!fire_weight || !fire_bias) return bad_argument("missing grouped fire head tensor");
+    const int count = active_counts[index];
+    const int offset = active_offsets[index];
+    const int slot_rows = count * ACTION_SLOTS;
+    error = launch_linear(workspace.slots.ptr, fire_weight, fire_bias, workspace.d_fire.ptr, slot_rows, D_MODEL, 1);
+    if (error != cudaSuccess) return cuda_error(error);
+    mask_planet_logits_kernel<<<blocks_for(slot_rows * PLANETS), 256>>>(workspace.d_source.ptr, workspace.d_planet_mask.ptr, count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+    mask_planet_logits_kernel<<<blocks_for(slot_rows * PLANETS), 256>>>(workspace.d_target.ptr, workspace.d_planet_mask.ptr, count);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+    CudaSimKernelState kernel_state = sim_kernel_state(sim_state);
+    kernel_state.config.step = step;
+    resident_decode_actions_kernel<<<blocks_for(count), 256>>>(
+        kernel_state,
+        sim_state->request_game_indices.ptr + offset,
+        sim_state->request_player_ids.ptr + offset,
+        count,
+        workspace.d_fire.ptr,
+        workspace.d_source.ptr,
+        workspace.d_target.ptr,
+        workspace.d_amount.ptr,
+        workspace.d_action_labels.ptr);
+    error = cudaGetLastError();
+    if (error != cudaSuccess) return cuda_error(error);
+  }
+  return ok();
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode_plan(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* opaque,
+    const int* request_offsets,
+    const int* request_counts,
+    size_t request_total,
+    int step) {
+  return resident_models_decode_plan_impl(
+      models,
+      model_count,
+      opaque,
+      request_offsets,
+      request_counts,
+      request_total,
+      step,
+      false);
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_step_plan(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* opaque,
+    const int* request_offsets,
+    const int* request_counts,
+    size_t request_total,
+    int step) {
+  OrbitWarsV8CudaStatus status = resident_models_decode_plan_impl(
+      models,
+      model_count,
+      opaque,
+      request_offsets,
+      request_counts,
+      request_total,
+      step,
+      false);
+  if (status.code != CUDA_STATUS_OK) {
+    return status;
+  }
+  return orbit_wars_cuda_sim_step_device_actions(opaque, step);
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_read_last_batch(
+    OrbitWarsV8CudaModel* model,
+    float* tokens,
+    long long* token_type_ids,
+    long long* owner_ids,
+    unsigned char* padding_mask,
+    unsigned char* planet_mask,
+    OrbitWarsCudaActionLabel* labels,
+    size_t request_capacity,
+    size_t* out_request_count) {
+  auto* model_state = reinterpret_cast<CudaModelState*>(model);
+  if (!model_state || !tokens || !token_type_ids || !owner_ids || !padding_mask ||
+      !planet_mask || !labels || !out_request_count) {
+    return bad_argument("null read last batch argument");
+  }
+  ForwardWorkspace& workspace = model_state->workspace;
+  const size_t request_count = workspace.last_request_count;
+  *out_request_count = request_count;
+  if (request_count == 0) {
+    return ok();
+  }
+  if (request_capacity < request_count) {
+    return bad_argument("read last batch capacity too small");
+  }
+  const size_t token_count = std::max<size_t>(1 + PLANETS, std::min<size_t>(workspace.last_token_count, RESIDENT_TOKEN_COUNT));
+  const size_t compact_token_values = request_count * token_count * TOKEN_FEATURES;
+  const size_t compact_meta_values = request_count * token_count;
+  const size_t full_token_values = request_count * RESIDENT_TOKEN_COUNT * TOKEN_FEATURES;
+  const size_t full_meta_values = request_count * RESIDENT_TOKEN_COUNT;
+  std::vector<float> compact_tokens(compact_token_values);
+  std::vector<long long> compact_token_type_ids(compact_meta_values);
+  std::vector<long long> compact_owner_ids(compact_meta_values);
+  std::vector<unsigned char> compact_padding_mask(compact_meta_values);
+  cudaError_t error = workspace.d_tokens.copy_to_host(compact_tokens.data(), compact_token_values);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.d_token_type_ids.copy_to_host(compact_token_type_ids.data(), compact_meta_values);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.d_owner_ids.copy_to_host(compact_owner_ids.data(), compact_meta_values);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.d_padding_mask.copy_to_host(compact_padding_mask.data(), compact_meta_values);
+  if (error != cudaSuccess) return cuda_error(error);
+  std::fill(tokens, tokens + full_token_values, 0.0f);
+  std::fill(token_type_ids, token_type_ids + full_meta_values, 0);
+  std::fill(owner_ids, owner_ids + full_meta_values, 0);
+  std::fill(padding_mask, padding_mask + full_meta_values, static_cast<unsigned char>(1));
+  for (size_t request = 0; request < request_count; ++request) {
+    const size_t compact_meta_base = request * token_count;
+    const size_t full_meta_base = request * RESIDENT_TOKEN_COUNT;
+    std::copy(
+        compact_tokens.begin() + compact_meta_base * TOKEN_FEATURES,
+        compact_tokens.begin() + (compact_meta_base + token_count) * TOKEN_FEATURES,
+        tokens + full_meta_base * TOKEN_FEATURES);
+    std::copy(
+        compact_token_type_ids.begin() + compact_meta_base,
+        compact_token_type_ids.begin() + compact_meta_base + token_count,
+        token_type_ids + full_meta_base);
+    std::copy(
+        compact_owner_ids.begin() + compact_meta_base,
+        compact_owner_ids.begin() + compact_meta_base + token_count,
+        owner_ids + full_meta_base);
+    std::copy(
+        compact_padding_mask.begin() + compact_meta_base,
+        compact_padding_mask.begin() + compact_meta_base + token_count,
+        padding_mask + full_meta_base);
+  }
+  error = workspace.d_planet_mask.copy_to_host(
+      planet_mask,
+      request_count * PLANETS);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = workspace.d_action_labels.copy_to_host(labels, request_count);
+  if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
 
@@ -2314,6 +3500,24 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_status_stats(
   return ok();
 }
 
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_actions(
+    OrbitWarsCudaSimState* opaque,
+    OrbitWarsCudaAction* actions,
+    int* action_counts) {
+  if (!opaque || !actions || !action_counts) {
+    return bad_argument("null sim read actions argument");
+  }
+  auto* state = reinterpret_cast<CudaSimState*>(opaque);
+  const auto& config = state->config;
+  cudaError_t error = state->actions.copy_to_host(
+      actions,
+      config.game_count * config.max_players * config.max_actions_per_player);
+  if (error != cudaSuccess) return cuda_error(error);
+  error = state->action_counts.copy_to_host(action_counts, config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
+  return ok();
+}
+
 extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_model_create(
     const OrbitWarsV8CudaTensor* tensors,
     size_t tensor_count,
@@ -2336,6 +3540,9 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_v8_model_create(
         std::string(tensors[index].name),
         DeviceTensor{buffer->ptr, tensors[index].len});
     model->owned_tensors.emplace_back(std::move(buffer));
+  }
+  if (!build_packed_weights(model->tensor_map, &model->weights)) {
+    return bad_argument("missing required packed OWV8 tensor");
   }
   *out_model = reinterpret_cast<OrbitWarsV8CudaModel*>(model.release());
   return ok();

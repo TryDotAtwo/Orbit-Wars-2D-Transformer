@@ -138,7 +138,7 @@ export async function loadTelemetry(): Promise<DashboardTelemetry> {
       ...artifact,
       replayGames,
       frames: artifactFrames,
-      metrics: completedMetrics(artifact.metrics ?? [], artifact.activeGeneration).map(hydrateMetric),
+      metrics: completedMetrics(artifact.metrics ?? [], artifact.activeGeneration, artifact.sourceMessage).map(hydrateMetric),
       generationWinRates: dedupGenerationWinRates(artifact.generationWinRates ?? []),
       models: (artifact.models ?? []).map(hydrateModel),
       validationErrors: artifact.validationErrors ?? [],
@@ -289,8 +289,16 @@ function dedupByGeneration<T extends { generation: number }>(items: T[]): T[] {
   );
 }
 
-function completedMetrics<T extends { generation: number }>(items: T[], activeGeneration: number): T[] {
-  return dedupByGeneration(items).filter((item) => Number(item.generation) < Number(activeGeneration));
+function completedMetrics<T extends { generation: number }>(
+  items: T[],
+  activeGeneration: number,
+  sourceMessage?: string,
+): T[] {
+  const generations = dedupByGeneration(items);
+  if (!sourceMessage?.includes('status=in_progress')) {
+    return generations;
+  }
+  return generations.filter((item) => Number(item.generation) < Number(activeGeneration));
 }
 
 function dedupGenerationWinRates(

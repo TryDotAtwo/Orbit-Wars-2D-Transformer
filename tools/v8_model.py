@@ -82,8 +82,9 @@ class V8ActionSlotTransformer(nn.Module):
         target_logits = self.target_head(slots)
         if planet_mask is not None:
             invalid = ~planet_mask.bool()
-            source_logits = source_logits.masked_fill(invalid[:, None, :], -1.0e9)
-            target_logits = target_logits.masked_fill(invalid[:, None, :], -1.0e9)
+            mask_value = torch.finfo(source_logits.dtype).min
+            source_logits = source_logits.masked_fill(invalid[:, None, :], mask_value)
+            target_logits = target_logits.masked_fill(invalid[:, None, :], mask_value)
         return {
             "fire_logits": self.fire_head(slots).squeeze(-1),
             "source_logits": source_logits,

@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Instant;
@@ -49,6 +50,7 @@ struct Cli {
     games_per_model: usize,
     players: usize,
     replay_stride: usize,
+    step_limit: Option<usize>,
     workers: usize,
     cpu_workers: usize,
     cuda_v8_smoke: bool,
@@ -59,6 +61,9 @@ struct Cli {
     output: PathBuf,
     model: Option<PathBuf>,
     model_list: Option<PathBuf>,
+    training_trace: Option<PathBuf>,
+    training_trace_capacity: usize,
+    training_trace_stride: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -114,6 +119,28 @@ struct ActiveModelGame {
     winner_player: Option<usize>,
 }
 
+#[derive(Clone, Debug)]
+struct TrainingTraceSample {
+    generation_game: usize,
+    step: usize,
+    model_id: usize,
+    player: usize,
+    outcome_reward: f32,
+    tokens: Vec<f32>,
+    token_type_ids: Vec<i64>,
+    owner_ids: Vec<i64>,
+    padding_mask: Vec<u8>,
+    planet_mask: Vec<u8>,
+    label: v8_cuda::OrbitWarsCudaActionLabel,
+}
+
+#[derive(Clone, Debug)]
+struct TrainingTrace {
+    samples: Vec<TrainingTraceSample>,
+    capacity: usize,
+    stride: usize,
+}
+
 fn main() -> Result<(), String> {
     let cli = parse_cli(env::args().skip(1))?;
     if cli.cuda_v8_smoke {
@@ -122,7 +149,10 @@ fn main() -> Result<(), String> {
         println!("{{\"event\":\"cuda_v8_smoke\",\"status\":\"ok\"}}");
         return Ok(());
     }
-    let config = AgentConfig::default();
+    let mut config = AgentConfig::default();
+    if let Some(step_limit) = cli.step_limit {
+        config.episode_steps = step_limit;
+    }
     if cli.cuda_sim_parity_smoke {
         return cuda_sim_parity_smoke(&config);
     }
@@ -143,6 +173,11 @@ fn main() -> Result<(), String> {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let started = Instant::now();
+        let mut training_trace = cli.training_trace.as_ref().map(|_| TrainingTrace {
+            samples: Vec::with_capacity(cli.training_trace_capacity.min(16_384)),
+            capacity: cli.training_trace_capacity,
+            stride: cli.training_trace_stride,
+        });
         let results = run_cuda_model_tournament(
             &models,
             cli.games_per_model,
@@ -152,7 +187,14 @@ fn main() -> Result<(), String> {
             cli.cpu_workers,
             cli.gpu_sim,
             &config,
+            training_trace.as_mut(),
         )?;
+        if let Some(trace) = training_trace.as_mut() {
+            annotate_training_trace_outcomes(trace, &results);
+        }
+        if let (Some(path), Some(trace)) = (cli.training_trace.as_ref(), training_trace.as_ref()) {
+            write_training_trace(path, trace)?;
+        }
         let elapsed = started.elapsed().as_secs_f32().max(1.0e-6);
         write_dashboard_telemetry(
             &cli.output,
@@ -228,6 +270,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         games_per_model: 20,
         players: DEFAULT_PLAYERS,
         replay_stride: 1,
+        step_limit: None,
         workers: 1,
         cpu_workers: 1,
         cuda_v8_smoke: false,
@@ -238,6 +281,9 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
         output: PathBuf::from(DEFAULT_OUTPUT),
         model: None,
         model_list: None,
+        training_trace: None,
+        training_trace_capacity: 4096,
+        training_trace_stride: 1,
     };
     let mut pending_key: Option<String> = None;
     for arg in args {
@@ -257,7 +303,7 @@ fn parse_cli(args: impl Iterator<Item = String>) -> Result<Cli, String> {
             cli.cuda_v8 = true;
         } else if arg == "--gpu-sim" {
             cli.gpu_sim = true;
-        } else if matches!(arg.as_str(), "--games" | "--games-per-model" | "--players" | "--replay-stride" | "--workers" | "--cpu-workers" | "--output" | "--model" | "--model-list") {
+        } else if matches!(arg.as_str(), "--games" | "--games-per-model" | "--players" | "--replay-stride" | "--step-limit" | "--workers" | "--cpu-workers" | "--output" | "--model" | "--model-list" | "--training-trace" | "--training-trace-capacity" | "--training-trace-stride") {
             pending_key = Some(arg);
         } else {
             return Err(format!("unknown_argument={arg}"));
@@ -292,9 +338,24 @@ fn apply_arg(cli: &mut Cli, key: &str, value: &str) -> Result<(), String> {
                 return Err("bad_replay_stride=0".to_string());
             }
         }
+        "--step-limit" => {
+            let step_limit = value.parse().map_err(|_| format!("bad_step_limit={value}"))?;
+            if step_limit == 0 {
+                return Err("bad_step_limit=0".to_string());
+            }
+            cli.step_limit = Some(step_limit);
+        }
         "--output" => cli.output = PathBuf::from(value),
         "--model" => cli.model = Some(PathBuf::from(value)),
         "--model-list" => cli.model_list = Some(PathBuf::from(value)),
+        "--training-trace" => cli.training_trace = Some(PathBuf::from(value)),
+        "--training-trace-capacity" => cli.training_trace_capacity = value.parse().map_err(|_| format!("bad_training_trace_capacity={value}"))?,
+        "--training-trace-stride" => {
+            cli.training_trace_stride = value.parse().map_err(|_| format!("bad_training_trace_stride={value}"))?;
+            if cli.training_trace_stride == 0 {
+                return Err("bad_training_trace_stride=0".to_string());
+            }
+        }
         _ => return Err(format!("unknown_argument={key}")),
     }
     Ok(())
@@ -448,6 +509,7 @@ fn run_cuda_model_tournament(
     cpu_workers: usize,
     gpu_sim: bool,
     config: &AgentConfig,
+    mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<Vec<GameResult>, String> {
     let cuda = v8_cuda::V8Cuda::open_from_environment()?;
     cuda.status()?;
@@ -461,7 +523,7 @@ fn run_cuda_model_tournament(
         tournament_schedule(models.len(), player_count, games_per_model)
     };
     let batch_games = if gpu_sim {
-        games_per_model.max(1).min(schedule.len().max(1))
+        workers.max(games_per_model).max(1).min(schedule.len().max(1))
     } else {
         workers.max(1).min(schedule.len().max(1))
     };
@@ -480,6 +542,7 @@ fn run_cuda_model_tournament(
             cpu_workers,
             gpu_sim,
             config,
+            training_trace.as_deref_mut(),
         )?);
         start = end;
     }
@@ -691,6 +754,7 @@ fn run_cuda_model_game_batch(
     cpu_workers: usize,
     gpu_sim: bool,
     config: &AgentConfig,
+    mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<Vec<GameResult>, String> {
     let mut games = schedule
         .iter()
@@ -705,12 +769,41 @@ fn run_cuda_model_game_batch(
         })
         .collect::<Vec<_>>();
     let mut gpu_sim_groups = if gpu_sim {
-        Some(create_gpu_sim_groups(cuda, &games, config, player_count, 4096, 8)?)
+        Some(create_gpu_sim_groups(cuda, &games, models.len(), config, player_count, 4096, 8)?)
     } else {
         None
     };
+    let mut last_progress_step = 0usize;
 
     while games.iter().any(|game| !game.done) {
+        if let Some(groups) = gpu_sim_groups.as_mut() {
+            let done_changed = step_active_model_games_gpu_resident(
+                groups,
+                &mut games,
+                cuda_models,
+                cuda,
+                replay_stride,
+                player_count,
+                training_trace.as_deref_mut(),
+            )?;
+            if done_changed {
+                *groups = create_gpu_sim_groups(cuda, &games, models.len(), config, player_count, 4096, 8)?;
+            }
+            let active_games = games.iter().filter(|game| !game.done).count();
+            let current_step = groups.first().map(|group| group.step).unwrap_or(0);
+            if current_step == 1 || current_step.saturating_sub(last_progress_step) >= 32 || active_games == 0 {
+                println!(
+                    "{{\"event\":\"arena_gpu_sim_progress\",\"game_offset\":{},\"games\":{},\"active_games\":{},\"step\":{}}}",
+                    game_offset,
+                    games.len(),
+                    active_games,
+                    current_step
+                );
+                last_progress_step = current_step;
+            }
+            continue;
+        }
+
         let mut requests_by_model = vec![Vec::<(usize, usize)>::new(); models.len()];
         for (game_index, game) in games.iter().enumerate() {
             if game.done {
@@ -719,21 +812,6 @@ fn run_cuda_model_game_batch(
             for player in 0..player_count {
                 requests_by_model[game.participant_models[player]].push((game_index, player));
             }
-        }
-        if let Some(groups) = gpu_sim_groups.as_mut() {
-            let done_changed = step_active_model_games_gpu_resident(
-                groups,
-                &mut games,
-                &requests_by_model,
-                cuda_models,
-                cuda,
-                replay_stride,
-                player_count,
-            )?;
-            if done_changed {
-                *groups = create_gpu_sim_groups(cuda, &games, config, player_count, 4096, 8)?;
-            }
-            continue;
         }
 
         let mut tokens_by_model = vec![Vec::new(); models.len()];
@@ -783,7 +861,7 @@ fn run_cuda_model_game_batch(
                 player_count,
             )?;
             if done_changed {
-                *groups = create_gpu_sim_groups(cuda, &games, config, player_count, 4096, 8)?;
+                *groups = create_gpu_sim_groups(cuda, &games, models.len(), config, player_count, 4096, 8)?;
             }
         } else {
             step_active_model_games(
@@ -823,6 +901,11 @@ fn run_cuda_model_game_batch(
 struct GpuSimGroup<'a> {
     sim_state: v8_cuda::CudaSimState<'a>,
     game_indices: Vec<usize>,
+    local_by_global_game: Vec<usize>,
+    request_offsets: Vec<i32>,
+    request_counts: Vec<i32>,
+    request_games: Vec<i32>,
+    requests_by_model: Vec<Vec<(usize, usize)>>,
     planet_counts: Vec<usize>,
     planet_count: usize,
     max_fleets: usize,
@@ -1015,11 +1098,11 @@ fn step_active_model_games_gpu_sim(
 fn step_active_model_games_gpu_resident(
     groups: &mut [GpuSimGroup<'_>],
     games: &mut [ActiveModelGame],
-    requests_by_model: &[Vec<(usize, usize)>],
     cuda_models: &[v8_cuda::V8CudaModel<'_>],
     cuda: &v8_cuda::V8Cuda,
     replay_stride: usize,
     player_count: usize,
+    mut training_trace: Option<&mut TrainingTrace>,
 ) -> Result<bool, String> {
     let Some(group) = groups.first_mut() else {
         return Ok(false);
@@ -1031,9 +1114,7 @@ fn step_active_model_games_gpu_resident(
         return Ok(false);
     }
     let step = group.step;
-    let mut local_by_game = vec![usize::MAX; games.len()];
-    for (local_game, &game_index) in group.game_indices.iter().enumerate() {
-        local_by_game[game_index] = local_game;
+    for &game_index in &group.game_indices {
         if games[game_index].done {
             continue;
         }
@@ -1046,37 +1127,41 @@ fn step_active_model_games_gpu_resident(
         }
     }
     group.sim_state.clear_actions()?;
-    let mut request_offsets = Vec::with_capacity(requests_by_model.len());
-    let mut request_counts = Vec::with_capacity(requests_by_model.len());
-    let mut request_games = Vec::new();
-    let mut request_players = Vec::new();
-    for requests in requests_by_model {
-        request_offsets.push(request_games.len() as i32);
-        for &(game_index, player) in requests {
-            let local_game = local_by_game
-                .get(game_index)
-                .copied()
-                .unwrap_or(usize::MAX);
-            if local_game == usize::MAX {
-                continue;
+    if !group.request_games.is_empty() {
+        let needs_trace_readback = training_trace
+            .as_ref()
+            .is_some_and(|trace| trace.samples.len() < trace.capacity && step % trace.stride == 0);
+        if needs_trace_readback {
+            cuda.resident_decode_many_plan(
+                cuda_models,
+                &group.sim_state,
+                &group.request_offsets,
+                &group.request_counts,
+                group.request_games.len(),
+                step,
+            )?;
+            if let Some(trace) = training_trace.as_deref_mut() {
+                collect_resident_training_trace(
+                    trace,
+                    cuda_models,
+                    &group.requests_by_model,
+                    &group.local_by_global_game,
+                    &group.game_indices,
+                    step,
+                )?;
             }
-            request_games.push(local_game as i32);
-            request_players.push(player as i32);
+            group.sim_state.step_device_actions(step)?;
+        } else {
+            cuda.resident_step_many_plan(
+                cuda_models,
+                &group.sim_state,
+                &group.request_offsets,
+                &group.request_counts,
+                group.request_games.len(),
+                step,
+            )?;
         }
-        request_counts.push((request_games.len() as i32) - *request_offsets.last().unwrap());
     }
-    if !request_games.is_empty() {
-        cuda.resident_decode_many(
-            cuda_models,
-            &group.sim_state,
-            &request_offsets,
-            &request_counts,
-            &request_games,
-            &request_players,
-            step,
-        )?;
-    }
-    group.sim_state.step_device_actions(step)?;
     group.step += 1;
 
     let next_step = group.step;
@@ -1171,9 +1256,75 @@ fn step_active_model_games_gpu_resident(
     Ok(false)
 }
 
+fn collect_resident_training_trace(
+    trace: &mut TrainingTrace,
+    cuda_models: &[v8_cuda::V8CudaModel<'_>],
+    requests_by_model: &[Vec<(usize, usize)>],
+    local_by_game: &[usize],
+    group_game_indices: &[usize],
+    step: usize,
+) -> Result<(), String> {
+    if trace.samples.len() >= trace.capacity || step % trace.stride != 0 {
+        return Ok(());
+    }
+    for (model_id, requests) in requests_by_model.iter().enumerate() {
+        if requests.is_empty() || trace.samples.len() >= trace.capacity {
+            continue;
+        }
+        let batch = cuda_models[model_id].read_last_batch(requests.len())?;
+        let request_count = batch.request_count.min(requests.len());
+        for request_index in 0..request_count {
+            if trace.samples.len() >= trace.capacity {
+                break;
+            }
+            let label = batch.labels[request_index];
+            if label.fire.iter().all(|value| *value == 0) {
+                continue;
+            }
+            let (global_game, player) = requests[request_index];
+            let local_game = *local_by_game.get(global_game).unwrap_or(&usize::MAX);
+            if local_game == usize::MAX {
+                continue;
+            }
+            let generation_game = group_game_indices.get(local_game).copied().unwrap_or(global_game);
+            let token_start = request_index * (1 + GPU_SIM_PLANETS + 640) * 14;
+            let token_end = token_start + (1 + GPU_SIM_PLANETS + 640) * 14;
+            let meta_start = request_index * (1 + GPU_SIM_PLANETS + 640);
+            let meta_end = meta_start + (1 + GPU_SIM_PLANETS + 640);
+            let planet_start = request_index * GPU_SIM_PLANETS;
+            let planet_end = planet_start + GPU_SIM_PLANETS;
+            trace.samples.push(TrainingTraceSample {
+                generation_game,
+                step,
+                model_id,
+                player,
+                outcome_reward: 0.0,
+                tokens: batch.tokens[token_start..token_end].to_vec(),
+                token_type_ids: batch.token_type_ids[meta_start..meta_end].to_vec(),
+                owner_ids: batch.owner_ids[meta_start..meta_end].to_vec(),
+                padding_mask: batch.padding_mask[meta_start..meta_end].to_vec(),
+                planet_mask: batch.planet_mask[planet_start..planet_end].to_vec(),
+                label,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn annotate_training_trace_outcomes(trace: &mut TrainingTrace, results: &[GameResult]) {
+    for sample in &mut trace.samples {
+        sample.outcome_reward = match results.get(sample.generation_game).and_then(|result| result.winner) {
+            Some(winner_model) if winner_model == sample.model_id => 1.0,
+            Some(_) => -1.0,
+            None => -1.0,
+        };
+    }
+}
+
 fn create_gpu_sim_groups<'a>(
     cuda: &'a v8_cuda::V8Cuda,
     games: &[ActiveModelGame],
+    model_count: usize,
     config: &AgentConfig,
     player_count: usize,
     max_fleets: usize,
@@ -1186,6 +1337,36 @@ fn create_gpu_sim_groups<'a>(
         .collect::<Vec<_>>();
     if game_indices.is_empty() {
         return Ok(Vec::new());
+    }
+    let mut local_by_global_game = vec![usize::MAX; games.len()];
+    for (local_game, &game_index) in game_indices.iter().enumerate() {
+        local_by_global_game[game_index] = local_game;
+    }
+    let mut requests_by_model = vec![Vec::<(usize, usize)>::new(); model_count];
+    for &game_index in &game_indices {
+        let game = &games[game_index];
+        for player in 0..player_count {
+            requests_by_model[game.participant_models[player]].push((game_index, player));
+        }
+    }
+    let mut request_offsets = Vec::with_capacity(requests_by_model.len());
+    let mut request_counts = Vec::with_capacity(requests_by_model.len());
+    let mut request_games = Vec::new();
+    let mut request_players = Vec::new();
+    for requests in &requests_by_model {
+        request_offsets.push(request_games.len() as i32);
+        for &(game_index, player) in requests {
+            let local_game = local_by_global_game
+                .get(game_index)
+                .copied()
+                .unwrap_or(usize::MAX);
+            if local_game == usize::MAX {
+                continue;
+            }
+            request_games.push(local_game as i32);
+            request_players.push(player as i32);
+        }
+        request_counts.push((request_games.len() as i32) - *request_offsets.last().unwrap());
     }
     let initial_step = games[game_indices[0]].state.step;
     let sim_config = v8_cuda::OrbitWarsCudaSimConfig::new(
@@ -1234,9 +1415,15 @@ fn create_gpu_sim_groups<'a>(
         next_fleet_ids.push(state.next_fleet_id);
     }
     sim_state.load_with_angular_velocities(&planets, &initial_planets, &fleets, &next_fleet_ids, &angular_velocities)?;
+    sim_state.load_request_plan(&request_games, &request_players)?;
     Ok(vec![GpuSimGroup {
         sim_state,
         game_indices,
+        local_by_global_game,
+        request_offsets,
+        request_counts,
+        request_games,
+        requests_by_model,
         planet_counts,
         planet_count: GPU_SIM_PLANETS,
         max_fleets,
@@ -2151,6 +2338,76 @@ fn write_dashboard_telemetry(
         replay_games_json(results, model_mode, replay_game_count)
     );
     fs::write(path, json).map_err(|error| format!("telemetry_write_failed={error}"))
+}
+
+fn write_training_trace(path: &PathBuf, trace: &TrainingTrace) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("training_trace_mkdir_failed={error}"))?;
+    }
+    let mut file = fs::File::create(path).map_err(|error| format!("training_trace_create_failed={error}"))?;
+    writeln!(
+        file,
+        "{{\"event\":\"training_trace_header\",\"samples\":{},\"capacity\":{},\"stride\":{}}}",
+        trace.samples.len(),
+        trace.capacity,
+        trace.stride
+    )
+    .map_err(|error| format!("training_trace_write_failed={error}"))?;
+    for sample in &trace.samples {
+        writeln!(
+            file,
+            "{{\"event\":\"sample\",\"game\":{},\"step\":{},\"model_id\":{},\"player\":{},\"outcome_reward\":{:.3},\"tokens\":[{}],\"token_type_ids\":[{}],\"owner_ids\":[{}],\"padding_mask\":[{}],\"planet_mask\":[{}],\"labels_fire\":[{}],\"labels_source\":[{}],\"labels_target\":[{}],\"labels_amount\":[{}]}}",
+            sample.generation_game,
+            sample.step,
+            sample.model_id,
+            sample.player,
+            sample.outcome_reward,
+            f32_array_json(&sample.tokens),
+            i64_array_json(&sample.token_type_ids),
+            i64_array_json(&sample.owner_ids),
+            u8_array_json(&sample.padding_mask),
+            u8_array_json(&sample.planet_mask),
+            slot_fire_json(&sample.label),
+            slot_label_json(&sample.label.source_row, &sample.label.fire),
+            slot_label_json(&sample.label.target_row, &sample.label.fire),
+            slot_label_json(&sample.label.amount_class, &sample.label.fire),
+        )
+        .map_err(|error| format!("training_trace_write_failed={error}"))?;
+    }
+    Ok(())
+}
+
+fn f32_array_json(values: &[f32]) -> String {
+    values
+        .iter()
+        .map(|value| if value.is_finite() { format!("{:.7}", value) } else { "0.0".to_string() })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn i64_array_json(values: &[i64]) -> String {
+    values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn u8_array_json(values: &[u8]) -> String {
+    values.iter().map(|value| value.to_string()).collect::<Vec<_>>().join(",")
+}
+
+fn slot_fire_json(label: &v8_cuda::OrbitWarsCudaActionLabel) -> String {
+    label.fire
+        .iter()
+        .map(|value| if *value != 0 { "1".to_string() } else { "0".to_string() })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn slot_label_json(values: &[i32; 8], fire: &[i32; 8]) -> String {
+    values
+        .iter()
+        .zip(fire.iter())
+        .map(|(value, active)| if *active != 0 { value.to_string() } else { "-1".to_string() })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn metric_json(

@@ -62,6 +62,17 @@ typedef struct OrbitWarsCudaAction {
   int ship_count;
 } OrbitWarsCudaAction;
 
+typedef struct OrbitWarsCudaActionLabel {
+  int fire[8];
+  int source_row[8];
+  int target_row[8];
+  int amount_class[8];
+  int source_planet_id[8];
+  int target_planet_id[8];
+  int ship_count[8];
+  float confidence[8];
+} OrbitWarsCudaActionLabel;
+
 typedef struct OrbitWarsCudaSimConfig {
   size_t game_count;
   size_t planet_count;
@@ -142,6 +153,12 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_persistent(
 OrbitWarsV8CudaStatus orbit_wars_cuda_sim_clear_actions(
     OrbitWarsCudaSimState* state);
 
+OrbitWarsV8CudaStatus orbit_wars_cuda_sim_load_request_plan(
+    OrbitWarsCudaSimState* state,
+    const int* request_game_indices,
+    const int* request_player_ids,
+    size_t request_count);
+
 OrbitWarsV8CudaStatus orbit_wars_cuda_sim_step_device_actions(
     OrbitWarsCudaSimState* state,
     int step);
@@ -171,6 +188,11 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_status_stats(
     OrbitWarsCudaSimState* state,
     OrbitWarsCudaGameStatus* statuses,
     OrbitWarsCudaSimStats* stats);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_actions(
+    OrbitWarsCudaSimState* state,
+    OrbitWarsCudaAction* actions,
+    int* action_counts);
 
 OrbitWarsV8CudaStatus orbit_wars_cuda_v8_model_create(
     const OrbitWarsV8CudaTensor* tensors,
@@ -216,6 +238,35 @@ OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode(
     const int* request_player_ids,
     size_t request_total,
     int step);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_decode_plan(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* state,
+    const int* request_offsets,
+    const int* request_counts,
+    size_t request_total,
+    int step);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_v8_resident_models_step_plan(
+    OrbitWarsV8CudaModel** models,
+    size_t model_count,
+    OrbitWarsCudaSimState* state,
+    const int* request_offsets,
+    const int* request_counts,
+    size_t request_total,
+    int step);
+
+OrbitWarsV8CudaStatus orbit_wars_cuda_v8_read_last_batch(
+    OrbitWarsV8CudaModel* model,
+    float* tokens,
+    long long* token_type_ids,
+    long long* owner_ids,
+    unsigned char* padding_mask,
+    unsigned char* planet_mask,
+    OrbitWarsCudaActionLabel* labels,
+    size_t request_capacity,
+    size_t* out_request_count);
 
 #ifdef __cplusplus
 }

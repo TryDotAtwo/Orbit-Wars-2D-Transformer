@@ -3,7 +3,7 @@
 
 Python stays at the orchestration boundary:
 - mutate/export a small population of OWV8 model bins;
-- run the native Rust arena for evaluation and replay/action traces;
+- run the native Rust arena for evaluation and compact training traces;
 - turn winning self-play actions into action-slot training samples;
 - backprop the selected checkpoint on GPU;
 - carry the best checkpoint into the next generation.
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import torch
+import numpy as np
 from torch import nn
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -36,14 +37,17 @@ from tools.v8_gpu_selfplay import run_gpu_selfplay
 
 @dataclass(frozen=True)
 class SelfPlayConfig:
-    generations: int = 4
-    population: int = 16
+    generations: int = 32
+    population: int = 64
     elites: int = 4
     mutations_per_elite: int = 3
     mutation_std: float = 0.015
-    games_per_candidate: int = 1
+    games_per_candidate: int = 20
     players: int = 4
-    replay_stride: int = 1
+    replay_stride: int = 500
+    arena_step_limit: int | None = None
+    arena_gpu_sim: bool = True
+    training_trace_stride: int = 1
     backprop_epochs: int = 1
     backprop_batch_size: int = 128
     backprop_lr: float = 1.0e-5
@@ -51,7 +55,15 @@ class SelfPlayConfig:
     source_loss_weight: float = 1.0
     amount_loss_weight: float = 0.75
     fire_loss_weight: float = 0.35
-    max_selfplay_samples: int = 4096
+    max_selfplay_samples: int | None = None
+
+    def training_trace_capacity(self) -> int:
+        if self.max_selfplay_samples is not None and self.max_selfplay_samples > 0:
+            return self.max_selfplay_samples
+        step_count = self.arena_step_limit or 500
+        sampled_steps = max(1, math.ceil(step_count / max(1, self.training_trace_stride)))
+        game_count = max(1, self.population * self.games_per_candidate // max(1, self.players))
+        return game_count * self.players * sampled_steps
 
 
 @dataclass(frozen=True)
@@ -81,26 +93,31 @@ def main() -> None:
     parser.add_argument("--base-model-bin", type=Path)
     parser.add_argument("--run-dir", type=Path, default=Path("runs/v8-selfplay-gpu"))
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
-    parser.add_argument("--arena-backend", choices=["gpu-python", "rust-cpu", "rust-cuda", "rust-cuda-population"], default="rust-cpu")
-    parser.add_argument("--arena-workers", type=int, default=1)
+    parser.add_argument("--arena-backend", choices=["gpu-python", "rust-cpu", "rust-cuda", "rust-cuda-population"], default="rust-cuda-population")
+    parser.add_argument("--arena-workers", type=int, default=0, help="0 = auto; for GPU population arena this batches all generation games together")
     parser.add_argument("--arena-cpu-workers", type=int, default=1)
-    parser.add_argument("--arena-gpu-sim", action="store_true")
+    parser.add_argument("--arena-gpu-sim", dest="arena_gpu_sim", action="store_true", default=True)
+    parser.add_argument("--no-arena-gpu-sim", dest="arena_gpu_sim", action="store_false")
     parser.add_argument("--arena-via-docker-compose", action="store_true")
     parser.add_argument("--docker-project", default="orbitwars")
     parser.add_argument("--docker-service", default="trainer")
-    parser.add_argument("--generations", type=int, default=4)
-    parser.add_argument("--population", type=int, default=16)
+    parser.add_argument("--generations", type=int, default=32)
+    parser.add_argument("--population", type=int, default=64)
     parser.add_argument("--elites", type=int, default=4)
     parser.add_argument("--mutations-per-elite", type=int, default=3)
     parser.add_argument("--mutation-std", type=float, default=0.015)
-    parser.add_argument("--games-per-candidate", type=int, default=1)
+    parser.add_argument("--games-per-candidate", type=int, default=20)
     parser.add_argument("--players", type=int, default=4)
+    parser.add_argument("--arena-step-limit", type=int)
     parser.add_argument("--backprop-epochs", type=int, default=1)
     parser.add_argument("--backprop-batch-size", type=int, default=128)
     parser.add_argument("--backprop-lr", type=float, default=1.0e-5)
     parser.add_argument("--target-loss-weight", type=float, default=2.0)
-    parser.add_argument("--replay-stride", type=int, default=1)
+    parser.add_argument("--replay-stride", type=int, default=500)
+    parser.add_argument("--training-trace-stride", type=int, default=1)
+    parser.add_argument("--max-selfplay-samples", type=int)
     parser.add_argument("--dashboard-telemetry", type=Path, default=Path("dashboard/public/telemetry/latest.json"))
+    parser.add_argument("--no-dashboard", action="store_true")
     parser.add_argument("--device", default=None)
     args = parser.parse_args()
     if not args.base_checkpoint and not args.base_model_bin:
@@ -114,6 +131,10 @@ def main() -> None:
         mutation_std=args.mutation_std,
         games_per_candidate=args.games_per_candidate,
         players=args.players,
+        arena_step_limit=args.arena_step_limit,
+        arena_gpu_sim=args.arena_gpu_sim,
+        training_trace_stride=args.training_trace_stride,
+        max_selfplay_samples=args.max_selfplay_samples,
         backprop_epochs=args.backprop_epochs,
         backprop_batch_size=args.backprop_batch_size,
         backprop_lr=args.backprop_lr,
@@ -130,7 +151,7 @@ def main() -> None:
         arena_workers=args.arena_workers,
         arena_cpu_workers=args.arena_cpu_workers,
         config=config,
-        dashboard_telemetry=args.dashboard_telemetry,
+        dashboard_telemetry=None if args.no_dashboard else args.dashboard_telemetry,
         device=args.device,
     )
 
@@ -179,6 +200,7 @@ def run_selfplay(
         "arena_cpu_workers": arena_cpu_workers,
         "device": device,
         "config": asdict(config),
+        "training_trace_capacity": config.training_trace_capacity(),
     }), flush=True)
 
     for generation in range(1, config.generations + 1):
@@ -193,6 +215,14 @@ def run_selfplay(
         selfplay_samples: list[dict[str, Any]] = []
         if arena_backend == "rust-cuda-population":
             telemetry_path = generation_dir / f"generation-{generation:04d}.population.telemetry.json"
+            training_trace_path = generation_dir / f"generation-{generation:04d}.training_trace.jsonl"
+            effective_arena_workers = arena_workers
+            if effective_arena_workers <= 0:
+                if config.arena_gpu_sim:
+                    generation_games = math.ceil(len(candidates) * config.games_per_candidate / max(1, config.players))
+                    effective_arena_workers = max(1, generation_games)
+                else:
+                    effective_arena_workers = 1
             run_population_arena(
                 arena_bin,
                 arena_prefix=arena_prefix,
@@ -202,16 +232,17 @@ def run_selfplay(
                 games_per_model=config.games_per_candidate,
                 players=config.players,
                 replay_stride=config.replay_stride,
-                workers=arena_workers,
+                step_limit=config.arena_step_limit,
+                workers=effective_arena_workers,
                 cpu_workers=arena_cpu_workers,
-                gpu_sim=bool(getattr(config, "arena_gpu_sim", False)),
+                gpu_sim=config.arena_gpu_sim,
+                training_trace_path=training_trace_path,
+                training_trace_capacity=config.training_trace_capacity(),
+                training_trace_stride=config.training_trace_stride,
             )
             telemetry = json.loads(telemetry_path.read_text(encoding="utf-8"))
             selfplay_samples.extend(
-                samples_from_population_telemetry(
-                    telemetry,
-                    f"selfplay:{generation}:population",
-                )
+                samples_from_training_trace(training_trace_path)
             )
             for index, candidate in enumerate(candidates):
                 model_row = (telemetry.get("models") or [{}])[index] if index < len(telemetry.get("models") or []) else {}
@@ -246,6 +277,7 @@ def run_selfplay(
                         games=config.games_per_candidate,
                         players=config.players,
                         replay_stride=config.replay_stride,
+                        step_limit=config.arena_step_limit,
                         workers=arena_workers,
                         cuda_v8=arena_backend == "rust-cuda",
                     )
@@ -266,13 +298,21 @@ def run_selfplay(
         ]
         if dashboard_telemetry:
             dashboard_telemetry.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(winner.telemetry, dashboard_telemetry)
+            write_dashboard_summary(
+                dashboard_telemetry,
+                run_dir=run_dir,
+                history=history,
+                generation=generation,
+                winner=winner,
+                backprop_metrics={"samples": 0.0, "loss": 0.0},
+                config=config,
+            )
         if selfplay_samples:
             champion_state, optimizer_state, backprop_metrics = backprop_on_selfplay(
                 champion_state,
                 optimizer_state,
                 model_config,
-                selfplay_samples[: config.max_selfplay_samples],
+                selfplay_samples[: config.training_trace_capacity()],
                 config,
                 device,
             )
@@ -291,6 +331,16 @@ def run_selfplay(
         )
         export_champion(run_dir, champion_state, model_config)
         write_history(run_dir, history, generation, winner, backprop_metrics, config)
+        if dashboard_telemetry:
+            write_dashboard_summary(
+                dashboard_telemetry,
+                run_dir=run_dir,
+                history=history,
+                generation=generation,
+                winner=winner,
+                backprop_metrics=backprop_metrics,
+                config=config,
+            )
         print(json.dumps({
             "event": "generation_complete",
             "generation": generation,
@@ -464,6 +514,7 @@ def run_arena(
     games: int,
     players: int,
     replay_stride: int,
+    step_limit: int | None,
     workers: int,
     cuda_v8: bool,
 ) -> None:
@@ -481,6 +532,8 @@ def run_arena(
     ]
     if cuda_v8:
         command.append("--cuda-v8")
+    if step_limit is not None:
+        command.append(f"--step-limit={step_limit}")
     started = time.perf_counter()
     completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
     if completed.returncode != 0:
@@ -503,9 +556,13 @@ def run_population_arena(
     games_per_model: int,
     players: int,
     replay_stride: int,
+    step_limit: int | None,
     workers: int,
     cpu_workers: int,
     gpu_sim: bool,
+    training_trace_path: Path,
+    training_trace_capacity: int,
+    training_trace_stride: int,
 ) -> None:
     model_list = generation_dir / "models.txt"
     model_list.write_text(
@@ -515,6 +572,7 @@ def run_population_arena(
     arena_arg = command_path(arena_bin, docker_style=bool(arena_prefix))
     model_list_arg = command_path(model_list, docker_style=bool(arena_prefix))
     telemetry_arg = command_path(telemetry_path, docker_style=bool(arena_prefix))
+    training_trace_arg = command_path(training_trace_path, docker_style=bool(arena_prefix))
     command = [
         *arena_prefix,
         arena_arg,
@@ -526,13 +584,27 @@ def run_population_arena(
         f"--workers={workers}",
         f"--cpu-workers={cpu_workers}",
         f"--output={telemetry_arg}",
+        f"--training-trace={training_trace_arg}",
+        f"--training-trace-capacity={training_trace_capacity}",
+        f"--training-trace-stride={training_trace_stride}",
     ]
+    if step_limit is not None:
+        command.append(f"--step-limit={step_limit}")
     if gpu_sim:
         command.append("--gpu-sim")
     started = time.perf_counter()
-    completed = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(f"population_arena_failed rc={completed.returncode} cmd={command} output={completed.stdout[-4000:]}")
+    arena_lines: list[str] = []
+    process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    assert process.stdout is not None
+    for line in process.stdout:
+        line = line.rstrip("\n")
+        arena_lines.append(line)
+        if len(arena_lines) > 20:
+            arena_lines = arena_lines[-20:]
+        print(line, flush=True)
+    returncode = process.wait()
+    if returncode != 0:
+        raise RuntimeError(f"population_arena_failed rc={returncode} cmd={command} output={chr(10).join(arena_lines[-20:])}")
     print(json.dumps({
         "event": "population_arena_eval",
         "models": len(candidates),
@@ -542,16 +614,21 @@ def run_population_arena(
         "cpu_workers": cpu_workers,
         "gpu_sim": gpu_sim,
         "telemetry": str(telemetry_path),
+        "training_trace": str(training_trace_path),
         "seconds": round(time.perf_counter() - started, 3),
-        "arena_tail": completed.stdout.splitlines()[-3:],
+        "arena_tail": arena_lines[-3:],
     }, ensure_ascii=False), flush=True)
 
 
 def command_path(path: Path, *, docker_style: bool) -> str:
-    value = path.as_posix()
     if not docker_style:
         return str(path)
-    return value
+    resolved = path.resolve()
+    try:
+        relative = resolved.relative_to(ROOT.resolve())
+    except ValueError:
+        return resolved.as_posix()
+    return "/workspace/" + relative.as_posix()
 
 
 def candidate_result(
@@ -633,68 +710,119 @@ def candidate_result_from_model_row(
 
 
 def samples_from_population_telemetry(telemetry: dict[str, Any], source_file: str) -> list[dict[str, Any]]:
-    frames = telemetry.get("frames") or []
     models = telemetry.get("models") or []
     winner_model_ids = {
         index
         for index, model in enumerate(models)
         if int(model.get("wins", 0)) > 0
     }
-    if not frames or not winner_model_ids:
+    if not winner_model_ids:
         return []
-    initial_planets = frame_planet_rows(frames[0])
     samples: list[dict[str, Any]] = []
-    for frame in frames:
-        actions_by_player = frame.get("actions") or []
-        model_ids = frame.get("modelIds") or []
-        for player, model_id in enumerate(model_ids):
-            if int(model_id) not in winner_model_ids:
-                continue
-            if player >= len(actions_by_player) or not actions_by_player[player]:
-                continue
-            observation = {
-                "player": player,
-                "step": int(frame.get("step", 0)),
-                "angular_velocity": float(telemetry.get("angularVelocity", 0.03)),
-                "planets": frame_planet_rows(frame),
-                "initial_planets": initial_planets,
-                "fleets": frame_fleet_rows(frame),
-            }
-            actions = [action_row(action) for action in actions_by_player[player]]
-            sample = build_sample(observation, actions, source_file, target_traces=None)
-            if int(sample["labels_fire"].sum()) > 0:
-                samples.append(sample)
+    for replay_index, frames in telemetry_frame_sets(telemetry):
+        if not frames:
+            continue
+        initial_planets = frame_planet_rows(frames[0])
+        for frame in frames:
+            actions_by_player = frame.get("actions") or []
+            model_ids = frame.get("modelIds") or []
+            for player, model_id in enumerate(model_ids):
+                if int(model_id) not in winner_model_ids:
+                    continue
+                if player >= len(actions_by_player) or not actions_by_player[player]:
+                    continue
+                observation = {
+                    "player": player,
+                    "step": int(frame.get("step", 0)),
+                    "angular_velocity": float(telemetry.get("angularVelocity", 0.03)),
+                    "planets": frame_planet_rows(frame),
+                    "initial_planets": initial_planets,
+                    "fleets": frame_fleet_rows(frame),
+                }
+                actions = [action_row(action) for action in actions_by_player[player]]
+                sample = build_sample(observation, actions, f"{source_file}:replay:{replay_index}", target_traces=None)
+                if int(sample["labels_fire"].sum()) > 0:
+                    samples.append(sample)
+    return samples
+
+
+def samples_from_training_trace(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    samples: list[dict[str, Any]] = []
+    token_count = 1 + 64 + 640
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        if row.get("event") != "sample":
+            continue
+        labels_fire = np.asarray(row["labels_fire"], dtype=np.float32)
+        if int(labels_fire.sum()) <= 0:
+            continue
+        tokens = np.asarray(row["tokens"], dtype=np.float32).reshape(token_count, 14)
+        padding = np.asarray(row["padding_mask"], dtype=np.bool_)
+        valid_length = int(np.argmax(padding)) if padding.any() else token_count
+        if valid_length <= 0:
+            valid_length = token_count
+        samples.append({
+            "tokens": tokens[:valid_length],
+            "token_type_ids": np.asarray(row["token_type_ids"], dtype=np.int64)[:valid_length],
+            "owner_ids": np.asarray(row["owner_ids"], dtype=np.int64)[:valid_length],
+            "sample_offsets": np.asarray([0, valid_length], dtype=np.int64),
+            "planet_mask": np.asarray(row["planet_mask"], dtype=np.bool_),
+            "labels_fire": labels_fire,
+            "labels_source": np.asarray(row["labels_source"], dtype=np.int64),
+            "labels_target": np.asarray(row["labels_target"], dtype=np.int64),
+            "labels_amount": np.asarray(row["labels_amount"], dtype=np.int64),
+            "outcome_reward": float(row.get("outcome_reward", 1.0)),
+            "episode_id": f"selfplay-trace-{row.get('game', 0)}",
+            "step": int(row.get("step", 0)),
+            "player": int(row.get("player", 0)),
+        })
     return samples
 
 
 def samples_from_telemetry(telemetry: dict[str, Any], source_file: str) -> list[dict[str, Any]]:
-    frames = telemetry.get("frames") or []
     models = telemetry.get("models") or []
     winner_slots = [index for index, model in enumerate(models) if int(model.get("wins", 0)) > 0]
     if not winner_slots:
         winner_slots = [0]
-    if not frames:
-        return []
-    initial_planets = frame_planet_rows(frames[0])
     samples: list[dict[str, Any]] = []
-    for frame in frames:
-        actions_by_player = frame.get("actions") or []
-        for player in winner_slots:
-            if player >= len(actions_by_player) or not actions_by_player[player]:
-                continue
-            observation = {
-                "player": player,
-                "step": int(frame.get("step", 0)),
-                "angular_velocity": float(telemetry.get("angularVelocity", 0.03)),
-                "planets": frame_planet_rows(frame),
-                "initial_planets": initial_planets,
-                "fleets": frame_fleet_rows(frame),
-            }
-            actions = [action_row(action) for action in actions_by_player[player]]
-            sample = build_sample(observation, actions, source_file, target_traces=None)
-            if int(sample["labels_fire"].sum()) > 0:
-                samples.append(sample)
+    for replay_index, frames in telemetry_frame_sets(telemetry):
+        if not frames:
+            continue
+        initial_planets = frame_planet_rows(frames[0])
+        for frame in frames:
+            actions_by_player = frame.get("actions") or []
+            for player in winner_slots:
+                if player >= len(actions_by_player) or not actions_by_player[player]:
+                    continue
+                observation = {
+                    "player": player,
+                    "step": int(frame.get("step", 0)),
+                    "angular_velocity": float(telemetry.get("angularVelocity", 0.03)),
+                    "planets": frame_planet_rows(frame),
+                    "initial_planets": initial_planets,
+                    "fleets": frame_fleet_rows(frame),
+                }
+                actions = [action_row(action) for action in actions_by_player[player]]
+                sample = build_sample(observation, actions, f"{source_file}:replay:{replay_index}", target_traces=None)
+                if int(sample["labels_fire"].sum()) > 0:
+                    samples.append(sample)
     return samples
+
+
+def telemetry_frame_sets(telemetry: dict[str, Any]) -> list[tuple[int, list[dict[str, Any]]]]:
+    replay_games = telemetry.get("replayGames") or []
+    frame_sets = [
+        (index, list(game.get("frames") or []))
+        for index, game in enumerate(replay_games)
+        if game.get("frames")
+    ]
+    if frame_sets:
+        return frame_sets
+    return [(0, list(telemetry.get("frames") or []))]
 
 
 def action_row(action: Any) -> list[float]:
@@ -743,9 +871,12 @@ def backprop_on_selfplay(
     config: SelfPlayConfig,
     device: str,
 ) -> tuple[dict[str, torch.Tensor], dict[str, Any], dict[str, float]]:
+    if device.startswith("cuda"):
+        torch.set_float32_matmul_precision("high")
     model = V8ActionSlotTransformer(model_config).to(device)
     model.load_state_dict(state)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.backprop_lr, weight_decay=0.01)
+    use_bf16 = device.startswith("cuda")
     if optimizer_state:
         try:
             optimizer.load_state_dict(optimizer_state)
@@ -759,14 +890,20 @@ def backprop_on_selfplay(
         for start in range(0, len(samples), config.backprop_batch_size):
             batch_samples = samples[start:start + config.backprop_batch_size]
             batch = {key: value.to(device) for key, value in collate_samples(batch_samples).items()}
-            outputs = model(
-                batch["tokens"],
-                batch["token_type_ids"],
-                batch["owner_ids"],
-                padding_mask=batch["padding_mask"],
-                planet_mask=batch["planet_mask"],
+            outcome_rewards = torch.as_tensor(
+                [float(sample.get("outcome_reward", 1.0)) for sample in batch_samples],
+                dtype=torch.float32,
+                device=device,
             )
-            loss, parts = weighted_action_loss(outputs, batch, config)
+            with torch.amp.autocast("cuda", dtype=torch.bfloat16, enabled=use_bf16):
+                outputs = model(
+                    batch["tokens"],
+                    batch["token_type_ids"],
+                    batch["owner_ids"],
+                    padding_mask=batch["padding_mask"],
+                    planet_mask=batch["planet_mask"],
+                )
+                loss, parts = weighted_action_loss(outputs, batch, config, outcome_rewards)
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -787,27 +924,70 @@ def weighted_action_loss(
     outputs: dict[str, torch.Tensor],
     batch: dict[str, torch.Tensor],
     config: SelfPlayConfig,
+    outcome_rewards: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    fire_loss = nn.functional.binary_cross_entropy_with_logits(outputs["fire_logits"], batch["labels_fire"].float())
+    fire_slot_loss = nn.functional.binary_cross_entropy_with_logits(
+        outputs["fire_logits"],
+        batch["labels_fire"].float(),
+        reduction="none",
+    )
+    fire_loss_by_sample = fire_slot_loss.float().mean(dim=1)
     active = batch["labels_fire"].bool()
+    batch_size = int(batch["labels_fire"].shape[0])
+    source_loss_by_sample = torch.zeros(batch_size, dtype=torch.float32, device=outputs["fire_logits"].device)
+    target_loss_by_sample = torch.zeros_like(source_loss_by_sample)
+    amount_loss_by_sample = torch.zeros_like(source_loss_by_sample)
     if active.any():
-        source_loss = nn.functional.cross_entropy(outputs["source_logits"][active], batch["labels_source"][active])
-        target_loss = nn.functional.cross_entropy(outputs["target_logits"][active], batch["labels_target"][active])
-        amount_loss = nn.functional.cross_entropy(outputs["amount_logits"][active], batch["labels_amount"][active])
+        active_rows = active.nonzero(as_tuple=False)[:, 0]
+        source_slot_loss = nn.functional.cross_entropy(
+            outputs["source_logits"][active],
+            batch["labels_source"][active],
+            reduction="none",
+        )
+        target_slot_loss = nn.functional.cross_entropy(
+            outputs["target_logits"][active],
+            batch["labels_target"][active],
+            reduction="none",
+        )
+        amount_slot_loss = nn.functional.cross_entropy(
+            outputs["amount_logits"][active],
+            batch["labels_amount"][active],
+            reduction="none",
+        )
+        source_slot_loss = source_slot_loss.float()
+        target_slot_loss = target_slot_loss.float()
+        amount_slot_loss = amount_slot_loss.float()
+        active_counts = torch.zeros(batch_size, dtype=torch.float32, device=outputs["fire_logits"].device)
+        active_counts.index_add_(0, active_rows, torch.ones_like(source_slot_loss))
+        active_counts = active_counts.clamp_min(1.0)
+        source_loss_by_sample.index_add_(0, active_rows, source_slot_loss)
+        target_loss_by_sample.index_add_(0, active_rows, target_slot_loss)
+        amount_loss_by_sample.index_add_(0, active_rows, amount_slot_loss)
+        source_loss_by_sample = source_loss_by_sample / active_counts
+        target_loss_by_sample = target_loss_by_sample / active_counts
+        amount_loss_by_sample = amount_loss_by_sample / active_counts
     else:
         zero = outputs["fire_logits"].sum() * 0.0
-        source_loss = target_loss = amount_loss = zero
-    loss = (
-        fire_loss * config.fire_loss_weight
-        + source_loss * config.source_loss_weight
-        + target_loss * config.target_loss_weight
-        + amount_loss * config.amount_loss_weight
+        source_loss_by_sample = source_loss_by_sample + zero
+        target_loss_by_sample = target_loss_by_sample + zero
+        amount_loss_by_sample = amount_loss_by_sample + zero
+    loss_by_sample = (
+        fire_loss_by_sample * config.fire_loss_weight
+        + source_loss_by_sample * config.source_loss_weight
+        + target_loss_by_sample * config.target_loss_weight
+        + amount_loss_by_sample * config.amount_loss_weight
     )
+    if outcome_rewards is None:
+        outcome_rewards = torch.ones_like(loss_by_sample)
+    outcome_rewards = outcome_rewards.to(loss_by_sample.device, dtype=loss_by_sample.dtype)
+    loss = (loss_by_sample * outcome_rewards).mean()
     return loss, {
-        "fire_loss": float(fire_loss.detach().cpu()),
-        "source_loss": float(source_loss.detach().cpu()),
-        "target_loss": float(target_loss.detach().cpu()),
-        "amount_loss": float(amount_loss.detach().cpu()),
+        "fire_loss": float(fire_loss_by_sample.mean().detach().cpu()),
+        "source_loss": float(source_loss_by_sample.mean().detach().cpu()),
+        "target_loss": float(target_loss_by_sample.mean().detach().cpu()),
+        "amount_loss": float(amount_loss_by_sample.mean().detach().cpu()),
+        "positive_samples": float((outcome_rewards > 0).sum().detach().cpu()),
+        "negative_samples": float((outcome_rewards < 0).sum().detach().cpu()),
     }
 
 
@@ -867,6 +1047,110 @@ def write_history(
         "candidates": [asdict(row) for row in history],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def write_dashboard_summary(
+    path: Path,
+    *,
+    run_dir: Path,
+    history: list[CandidateResult],
+    generation: int,
+    winner: CandidateResult,
+    backprop_metrics: dict[str, float],
+    config: SelfPlayConfig,
+) -> None:
+    source = json.loads(Path(winner.telemetry).read_text(encoding="utf-8"))
+    latest_by_generation: list[dict[str, Any]] = []
+    for gen in range(1, generation + 1):
+        rows = [row for row in history if row.generation == gen]
+        if not rows:
+            continue
+        best = max(rows, key=lambda row: row.score)
+        evaluated_games = sum(row.wins + row.draws + row.losses for row in rows)
+        latest_by_generation.append({
+            "generation": gen,
+            "winRate": best.win_rate,
+            "gamesPerSecond": (source.get("gamesPerSecond") or 0.0),
+            "turnsPerSecond": (source.get("turnsPerSecond") or 0.0),
+            "p95LatencyMs": 0.0,
+            "gpuUtilization": 0,
+            "evaluatedGames": evaluated_games,
+            "sampledReplayGames": min(4, len(source.get("replayGames") or [])),
+            "modelActionCalls": (source.get("metrics") or [{}])[-1].get("modelActionCalls", 0),
+            "launchActions": sum(row.launch_actions for row in rows),
+            "launchedShips": (source.get("metrics") or [{}])[-1].get("launchedShips", 0),
+            "captures": sum(row.captures for row in rows),
+            "fleetHits": sum(row.fleet_hits for row in rows),
+            "hitShips": (source.get("metrics") or [{}])[-1].get("hitShips", 0),
+            "sunDestroyedFleets": sum(row.sun_destroyed_fleets for row in rows),
+            "sunDestroyedShips": (source.get("metrics") or [{}])[-1].get("sunDestroyedShips", 0),
+            "avgFleetSize": 0.0,
+            "avgLaunchActionsPerTurn": 0.0,
+            "avgLaunchedShipsPerTurn": 0.0,
+            "avgModelActionMs": 0.0,
+            "inferenceBatchCalls": (source.get("metrics") or [{}])[-1].get("inferenceBatchCalls", 0),
+            "maxInferenceBatchSize": (source.get("metrics") or [{}])[-1].get("maxInferenceBatchSize", 0),
+            "simultaneousGames": config.population,
+            "modelActionSeconds": 0.0,
+            "simulationStepSeconds": 0.0,
+            "evaluationSeconds": 0.0,
+            "replaySeconds": 0.0,
+            "replayWriteSeconds": 0.0,
+            "generationValidationGames": evaluated_games,
+            "generationValidationSeconds": 0.0,
+            "backpropSamples": backprop_metrics.get("samples", 0.0) if gen == generation else 0.0,
+            "backpropModels": 1 if gen == generation and backprop_metrics.get("samples", 0.0) else 0,
+            "backpropSeconds": 0.0,
+            "reproductionSeconds": 0.0,
+            "generationSeconds": 0.0,
+        })
+    source["runId"] = run_dir.name
+    source["activeGeneration"] = generation
+    source["populationSize"] = config.population
+    source["eliteCount"] = config.elites
+    source["gamesPerModel"] = config.games_per_candidate
+    source["replaysPerModel"] = 4
+    source["generationReplayGameCount"] = 4
+    source["storedReplayGames"] = min(4, len(source.get("replayGames") or []))
+    source["metrics"] = latest_by_generation
+    source["generationWinRates"] = [
+        {
+            "validationGeneration": row.generation,
+            "evaluatedGeneration": row.generation,
+            "modelCount": config.population,
+            "games": row.wins + row.draws + row.losses,
+            "wins": row.wins,
+            "draws": row.draws,
+            "losses": row.losses,
+            "winRate": row.win_rate,
+        }
+        for row in history
+    ]
+    source["models"] = [
+        {
+            "id": row.candidate_id,
+            "parent": row.parent_id,
+            "rating": int(600 + row.score),
+            "wins": row.wins,
+            "draws": row.draws,
+            "losses": row.losses,
+            "games": row.wins + row.draws + row.losses,
+            "captures": row.captures,
+            "fleetHits": row.fleet_hits,
+            "hitShips": 0,
+            "sunDestroyedFleets": row.sun_destroyed_fleets,
+            "sunDestroyedShips": 0,
+            "outOfBoundsFleets": 0,
+            "outOfBoundsShips": 0,
+            "launchActions": row.launch_actions,
+            "launchedShips": 0,
+            "avgFleetSize": 0.0,
+            "mutation": row.role,
+            "selected": row.candidate_id == winner.candidate_id,
+        }
+        for row in sorted([row for row in history if row.generation == generation], key=lambda item: item.score, reverse=True)
+    ]
+    path.write_text(json.dumps(source, ensure_ascii=False), encoding="utf-8")
 
 
 if __name__ == "__main__":

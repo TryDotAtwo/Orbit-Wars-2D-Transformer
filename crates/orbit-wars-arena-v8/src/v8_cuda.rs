@@ -17,17 +17,24 @@ const SIM_LOAD_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_load\0";
 const SIM_LOAD_WITH_ANGULAR_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_load_with_angular_velocities\0";
 const SIM_STEP_PERSISTENT_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_step_persistent\0";
 const SIM_CLEAR_ACTIONS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_clear_actions\0";
+const SIM_LOAD_REQUEST_PLAN_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_load_request_plan\0";
 const SIM_STEP_DEVICE_ACTIONS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_step_device_actions\0";
 const SIM_READ_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read\0";
 const SIM_READ_PLANETS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_planets_stats\0";
 const SIM_READ_STATUS_STATS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_status_stats\0";
+const SIM_READ_ACTIONS_SYMBOL: &[u8] = b"orbit_wars_cuda_sim_read_actions\0";
 const RESIDENT_MODEL_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_model_decode\0";
 const RESIDENT_MODELS_DECODE_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_decode\0";
+const RESIDENT_MODELS_DECODE_PLAN_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_decode_plan\0";
+const RESIDENT_MODELS_STEP_PLAN_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_resident_models_step_plan\0";
+const READ_LAST_BATCH_SYMBOL: &[u8] = b"orbit_wars_cuda_v8_read_last_batch\0";
 const DEFAULT_CUDA_V8_LIBRARY_PATH: &str = "target/liborbit_wars_v8_cuda.so";
 const TOKEN_FEATURES: usize = 14;
 const ACTION_SLOTS: usize = 8;
 const PLANETS: usize = 64;
 const AMOUNTS: usize = 16;
+const MAX_TOKEN_FLEETS: usize = 640;
+const RESIDENT_TOKEN_COUNT: usize = 1 + PLANETS + MAX_TOKEN_FLEETS;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -95,6 +102,19 @@ pub struct OrbitWarsCudaAction {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OrbitWarsCudaActionLabel {
+    pub fire: [i32; ACTION_SLOTS],
+    pub source_row: [i32; ACTION_SLOTS],
+    pub target_row: [i32; ACTION_SLOTS],
+    pub amount_class: [i32; ACTION_SLOTS],
+    pub source_planet_id: [i32; ACTION_SLOTS],
+    pub target_planet_id: [i32; ACTION_SLOTS],
+    pub ship_count: [i32; ACTION_SLOTS],
+    pub confidence: [f32; ACTION_SLOTS],
+}
+
+#[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct OrbitWarsCudaSimConfig {
     game_count: usize,
@@ -136,6 +156,17 @@ pub struct OrbitWarsCudaGameStatus {
     pub done: i32,
     pub winner: i32,
     pub step: i32,
+}
+
+#[derive(Clone, Debug)]
+pub struct LastBatchTrace {
+    pub request_count: usize,
+    pub tokens: Vec<f32>,
+    pub token_type_ids: Vec<i64>,
+    pub owner_ids: Vec<i64>,
+    pub padding_mask: Vec<u8>,
+    pub planet_mask: Vec<u8>,
+    pub labels: Vec<OrbitWarsCudaActionLabel>,
 }
 
 impl From<Planet> for OrbitWarsCudaPlanet {
@@ -312,6 +343,12 @@ type SimStepPersistentFn = unsafe extern "C" fn(
     step: i32,
 ) -> OrbitWarsV8CudaStatus;
 type SimClearActionsFn = unsafe extern "C" fn(state: *mut c_void) -> OrbitWarsV8CudaStatus;
+type SimLoadRequestPlanFn = unsafe extern "C" fn(
+    state: *mut c_void,
+    request_game_indices: *const i32,
+    request_player_ids: *const i32,
+    request_count: usize,
+) -> OrbitWarsV8CudaStatus;
 type SimStepDeviceActionsFn = unsafe extern "C" fn(
     state: *mut c_void,
     step: i32,
@@ -334,6 +371,11 @@ type SimReadStatusStatsFn = unsafe extern "C" fn(
     statuses: *mut OrbitWarsCudaGameStatus,
     stats: *mut OrbitWarsCudaSimStats,
 ) -> OrbitWarsV8CudaStatus;
+type SimReadActionsFn = unsafe extern "C" fn(
+    state: *mut c_void,
+    actions: *mut OrbitWarsCudaAction,
+    action_counts: *mut i32,
+) -> OrbitWarsV8CudaStatus;
 type ResidentModelDecodeFn = unsafe extern "C" fn(
     model: *mut c_void,
     state: *mut c_void,
@@ -353,6 +395,35 @@ type ResidentModelsDecodeFn = unsafe extern "C" fn(
     request_total: usize,
     step: i32,
 ) -> OrbitWarsV8CudaStatus;
+type ResidentModelsDecodePlanFn = unsafe extern "C" fn(
+    models: *const *mut c_void,
+    model_count: usize,
+    state: *mut c_void,
+    request_offsets: *const i32,
+    request_counts: *const i32,
+    request_total: usize,
+    step: i32,
+) -> OrbitWarsV8CudaStatus;
+type ResidentModelsStepPlanFn = unsafe extern "C" fn(
+    models: *const *mut c_void,
+    model_count: usize,
+    state: *mut c_void,
+    request_offsets: *const i32,
+    request_counts: *const i32,
+    request_total: usize,
+    step: i32,
+) -> OrbitWarsV8CudaStatus;
+type ReadLastBatchFn = unsafe extern "C" fn(
+    model: *mut c_void,
+    tokens: *mut f32,
+    token_type_ids: *mut i64,
+    owner_ids: *mut i64,
+    padding_mask: *mut u8,
+    planet_mask: *mut u8,
+    labels: *mut OrbitWarsCudaActionLabel,
+    request_capacity: usize,
+    out_request_count: *mut usize,
+) -> OrbitWarsV8CudaStatus;
 
 pub struct V8Cuda {
     library_handle: *mut c_void,
@@ -369,12 +440,17 @@ pub struct V8Cuda {
     sim_load_with_angular_fn: SimLoadWithAngularFn,
     sim_step_persistent_fn: SimStepPersistentFn,
     sim_clear_actions_fn: SimClearActionsFn,
+    sim_load_request_plan_fn: SimLoadRequestPlanFn,
     sim_step_device_actions_fn: SimStepDeviceActionsFn,
     sim_read_fn: SimReadFn,
     sim_read_planets_stats_fn: SimReadPlanetsStatsFn,
     sim_read_status_stats_fn: SimReadStatusStatsFn,
+    sim_read_actions_fn: SimReadActionsFn,
     resident_model_decode_fn: ResidentModelDecodeFn,
     resident_models_decode_fn: ResidentModelsDecodeFn,
+    resident_models_decode_plan_fn: ResidentModelsDecodePlanFn,
+    resident_models_step_plan_fn: ResidentModelsStepPlanFn,
+    read_last_batch_fn: ReadLastBatchFn,
 }
 
 impl V8Cuda {
@@ -450,6 +526,11 @@ impl V8Cuda {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_sim_clear_actions_symbol_missing={}", dlerror_text()));
         }
+        let sim_load_request_plan_fn = unsafe { dlsym(handle, SIM_LOAD_REQUEST_PLAN_SYMBOL.as_ptr() as *const c_char) };
+        if sim_load_request_plan_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_sim_load_request_plan_symbol_missing={}", dlerror_text()));
+        }
         let sim_step_device_actions_fn = unsafe { dlsym(handle, SIM_STEP_DEVICE_ACTIONS_SYMBOL.as_ptr() as *const c_char) };
         if sim_step_device_actions_fn.is_null() {
             unsafe { dlclose(handle) };
@@ -470,6 +551,11 @@ impl V8Cuda {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_sim_read_status_stats_symbol_missing={}", dlerror_text()));
         }
+        let sim_read_actions_fn = unsafe { dlsym(handle, SIM_READ_ACTIONS_SYMBOL.as_ptr() as *const c_char) };
+        if sim_read_actions_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_sim_read_actions_symbol_missing={}", dlerror_text()));
+        }
         let resident_model_decode_fn = unsafe { dlsym(handle, RESIDENT_MODEL_DECODE_SYMBOL.as_ptr() as *const c_char) };
         if resident_model_decode_fn.is_null() {
             unsafe { dlclose(handle) };
@@ -479,6 +565,21 @@ impl V8Cuda {
         if resident_models_decode_fn.is_null() {
             unsafe { dlclose(handle) };
             return Err(format!("cuda_resident_models_decode_symbol_missing={}", dlerror_text()));
+        }
+        let resident_models_decode_plan_fn = unsafe { dlsym(handle, RESIDENT_MODELS_DECODE_PLAN_SYMBOL.as_ptr() as *const c_char) };
+        if resident_models_decode_plan_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_resident_models_decode_plan_symbol_missing={}", dlerror_text()));
+        }
+        let resident_models_step_plan_fn = unsafe { dlsym(handle, RESIDENT_MODELS_STEP_PLAN_SYMBOL.as_ptr() as *const c_char) };
+        if resident_models_step_plan_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_resident_models_step_plan_symbol_missing={}", dlerror_text()));
+        }
+        let read_last_batch_fn = unsafe { dlsym(handle, READ_LAST_BATCH_SYMBOL.as_ptr() as *const c_char) };
+        if read_last_batch_fn.is_null() {
+            unsafe { dlclose(handle) };
+            return Err(format!("cuda_read_last_batch_symbol_missing={}", dlerror_text()));
         }
         Ok(Self {
             library_handle: handle,
@@ -494,12 +595,17 @@ impl V8Cuda {
             sim_load_with_angular_fn: unsafe { std::mem::transmute::<*mut c_void, SimLoadWithAngularFn>(sim_load_with_angular_fn) },
             sim_step_persistent_fn: unsafe { std::mem::transmute::<*mut c_void, SimStepPersistentFn>(sim_step_persistent_fn) },
             sim_clear_actions_fn: unsafe { std::mem::transmute::<*mut c_void, SimClearActionsFn>(sim_clear_actions_fn) },
+            sim_load_request_plan_fn: unsafe { std::mem::transmute::<*mut c_void, SimLoadRequestPlanFn>(sim_load_request_plan_fn) },
             sim_step_device_actions_fn: unsafe { std::mem::transmute::<*mut c_void, SimStepDeviceActionsFn>(sim_step_device_actions_fn) },
             sim_read_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadFn>(sim_read_fn) },
             sim_read_planets_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadPlanetsStatsFn>(sim_read_planets_stats_fn) },
             sim_read_status_stats_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadStatusStatsFn>(sim_read_status_stats_fn) },
+            sim_read_actions_fn: unsafe { std::mem::transmute::<*mut c_void, SimReadActionsFn>(sim_read_actions_fn) },
             resident_model_decode_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelDecodeFn>(resident_model_decode_fn) },
             resident_models_decode_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsDecodeFn>(resident_models_decode_fn) },
+            resident_models_decode_plan_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsDecodePlanFn>(resident_models_decode_plan_fn) },
+            resident_models_step_plan_fn: unsafe { std::mem::transmute::<*mut c_void, ResidentModelsStepPlanFn>(resident_models_step_plan_fn) },
+            read_last_batch_fn: unsafe { std::mem::transmute::<*mut c_void, ReadLastBatchFn>(read_last_batch_fn) },
         })
     }
 
@@ -605,6 +711,70 @@ impl V8Cuda {
             )
         };
         require_ok(status, "cuda_resident_models_decode")
+    }
+
+    pub fn resident_decode_many_plan(
+        &self,
+        models: &[V8CudaModel<'_>],
+        sim_state: &CudaSimState<'_>,
+        request_offsets: &[i32],
+        request_counts: &[i32],
+        request_total: usize,
+        step: usize,
+    ) -> Result<(), String> {
+        if request_offsets.len() != models.len() || request_counts.len() != models.len() {
+            return Err(format!(
+                "resident_decode_many_plan_model_len_mismatch=models:{} offsets:{} counts:{}",
+                models.len(),
+                request_offsets.len(),
+                request_counts.len()
+            ));
+        }
+        let model_ptrs = models.iter().map(|model| model.pointer).collect::<Vec<_>>();
+        let status = unsafe {
+            (self.resident_models_decode_plan_fn)(
+                model_ptrs.as_ptr(),
+                model_ptrs.len(),
+                sim_state.pointer,
+                request_offsets.as_ptr(),
+                request_counts.as_ptr(),
+                request_total,
+                step as i32,
+            )
+        };
+        require_ok(status, "cuda_resident_models_decode_plan")
+    }
+
+    pub fn resident_step_many_plan(
+        &self,
+        models: &[V8CudaModel<'_>],
+        sim_state: &CudaSimState<'_>,
+        request_offsets: &[i32],
+        request_counts: &[i32],
+        request_total: usize,
+        step: usize,
+    ) -> Result<(), String> {
+        if request_offsets.len() != models.len() || request_counts.len() != models.len() {
+            return Err(format!(
+                "resident_step_many_plan_model_len_mismatch=models:{} offsets:{} counts:{}",
+                models.len(),
+                request_offsets.len(),
+                request_counts.len()
+            ));
+        }
+        let model_ptrs = models.iter().map(|model| model.pointer).collect::<Vec<_>>();
+        let status = unsafe {
+            (self.resident_models_step_plan_fn)(
+                model_ptrs.as_ptr(),
+                model_ptrs.len(),
+                sim_state.pointer,
+                request_offsets.as_ptr(),
+                request_counts.as_ptr(),
+                request_total,
+                step as i32,
+            )
+        };
+        require_ok(status, "cuda_resident_models_step_plan")
     }
 
     #[allow(dead_code)]
@@ -782,6 +952,29 @@ impl CudaSimState<'_> {
         require_ok(status, "cuda_sim_clear_actions")
     }
 
+    pub fn load_request_plan(
+        &self,
+        request_game_indices: &[i32],
+        request_player_ids: &[i32],
+    ) -> Result<(), String> {
+        if request_game_indices.len() != request_player_ids.len() {
+            return Err(format!(
+                "cuda_request_plan_len_mismatch={}!={}",
+                request_game_indices.len(),
+                request_player_ids.len()
+            ));
+        }
+        let status = unsafe {
+            (self.cuda.sim_load_request_plan_fn)(
+                self.pointer,
+                request_game_indices.as_ptr(),
+                request_player_ids.as_ptr(),
+                request_game_indices.len(),
+            )
+        };
+        require_ok(status, "cuda_sim_load_request_plan")
+    }
+
     pub fn step_device_actions(&self, step: usize) -> Result<(), String> {
         let status = unsafe { (self.cuda.sim_step_device_actions_fn)(self.pointer, step as i32) };
         require_ok(status, "cuda_sim_step_device_actions")
@@ -849,6 +1042,46 @@ impl Drop for CudaSimState<'_> {
 }
 
 impl V8CudaModel<'_> {
+    pub fn read_last_batch(&self, request_capacity: usize) -> Result<LastBatchTrace, String> {
+        let token_count = RESIDENT_TOKEN_COUNT;
+        let mut tokens = vec![0.0f32; request_capacity * token_count * TOKEN_FEATURES];
+        let mut token_type_ids = vec![0i64; request_capacity * token_count];
+        let mut owner_ids = vec![0i64; request_capacity * token_count];
+        let mut padding_mask = vec![0u8; request_capacity * token_count];
+        let mut planet_mask = vec![0u8; request_capacity * PLANETS];
+        let mut labels = vec![OrbitWarsCudaActionLabel::default(); request_capacity];
+        let mut request_count = 0usize;
+        let status = unsafe {
+            (self.cuda.read_last_batch_fn)(
+                self.pointer,
+                tokens.as_mut_ptr(),
+                token_type_ids.as_mut_ptr(),
+                owner_ids.as_mut_ptr(),
+                padding_mask.as_mut_ptr(),
+                planet_mask.as_mut_ptr(),
+                labels.as_mut_ptr(),
+                request_capacity,
+                &mut request_count as *mut usize,
+            )
+        };
+        require_ok(status, "cuda_read_last_batch")?;
+        tokens.truncate(request_count * token_count * TOKEN_FEATURES);
+        token_type_ids.truncate(request_count * token_count);
+        owner_ids.truncate(request_count * token_count);
+        padding_mask.truncate(request_count * token_count);
+        planet_mask.truncate(request_count * PLANETS);
+        labels.truncate(request_count);
+        Ok(LastBatchTrace {
+            request_count,
+            tokens,
+            token_type_ids,
+            owner_ids,
+            padding_mask,
+            planet_mask,
+            labels,
+        })
+    }
+
     pub fn resident_decode(
         &self,
         sim_state: &CudaSimState<'_>,

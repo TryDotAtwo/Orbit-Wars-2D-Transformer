@@ -2,9 +2,18 @@
 set -euo pipefail
 
 mkdir -p target
-nvcc -std=c++17 -O3 -shared -Xcompiler -fPIC \
+CUDA_ARCH="${CUDA_ARCH:-sm_86}"
+CUTLASS_ROOT="${CUTLASS_PATH:-/opt/cutlass}"
+CUTLASS_INCLUDES=()
+if [[ -d "${CUTLASS_ROOT}/include" ]]; then
+  CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/include")
+fi
+if [[ -d "${CUTLASS_ROOT}/tools/util/include" ]]; then
+  CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/tools/util/include")
+fi
+nvcc -std=c++17 -O3 "-arch=${CUDA_ARCH}" -shared -Xcompiler -fPIC \
+  "${CUTLASS_INCLUDES[@]}" \
   native/cuda/orbit_wars_v8_cuda.cu \
-  -lcublas \
   -o target/liborbit_wars_v8_cuda.so
 g++ -std=c++17 -O3 \
   native/cuda/orbit_wars_v8_cuda_smoke.cpp \
