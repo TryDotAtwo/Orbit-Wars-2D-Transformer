@@ -85,6 +85,7 @@ for root in site.getsitepackages() + [site.getusersitepackages()]:
         if (
             (include / "cuda_runtime.h").exists()
             or (include / "nv" / "target").exists()
+            or (include / "crt" / "host_runtime.h").exists()
         ) and include not in seen_includes:
             include_flags.append(f"-I{include}")
             seen_includes.add(include)
