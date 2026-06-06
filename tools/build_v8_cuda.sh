@@ -2,7 +2,41 @@
 set -euo pipefail
 
 mkdir -p target
-CUDA_ARCH="${CUDA_ARCH:-sm_86}"
+if [[ -z "${CUDA_ARCH:-}" ]]; then
+  CUDA_ARCH="$(python3 - <<'PY'
+try:
+    import torch
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability(0)
+        print(f"sm_{major}{minor}")
+    else:
+        print("sm_86")
+except Exception:
+    print("sm_86")
+PY
+)"
+fi
+NVCC_BIN="${NVCC:-}"
+if [[ -z "${NVCC_BIN}" ]]; then
+  NVCC_BIN="$(command -v nvcc || true)"
+fi
+if [[ -z "${NVCC_BIN}" ]]; then
+  NVCC_BIN="$(python3 - <<'PY'
+import pathlib
+import site
+
+for root in site.getsitepackages() + [site.getusersitepackages()]:
+    candidate = pathlib.Path(root) / "nvidia" / "cuda_nvcc" / "bin" / "nvcc"
+    if candidate.exists():
+        print(candidate)
+        break
+PY
+)"
+fi
+if [[ -z "${NVCC_BIN}" || ! -x "${NVCC_BIN}" ]]; then
+  echo "nvcc not found; install nvidia-cuda-nvcc-cu13 or set NVCC=/path/to/nvcc" >&2
+  exit 127
+fi
 CUTLASS_ROOT="${CUTLASS_PATH:-/opt/cutlass}"
 CUTLASS_INCLUDES=()
 if [[ -d "${CUTLASS_ROOT}/include" ]]; then
@@ -11,7 +45,7 @@ fi
 if [[ -d "${CUTLASS_ROOT}/tools/util/include" ]]; then
   CUTLASS_INCLUDES+=("-I${CUTLASS_ROOT}/tools/util/include")
 fi
-nvcc -std=c++17 -O3 "-arch=${CUDA_ARCH}" -shared -Xcompiler -fPIC \
+"${NVCC_BIN}" -std=c++17 -O3 "-arch=${CUDA_ARCH}" -shared -Xcompiler -fPIC \
   "${CUTLASS_INCLUDES[@]}" \
   native/cuda/orbit_wars_v8_cuda.cu \
   -o target/liborbit_wars_v8_cuda.so

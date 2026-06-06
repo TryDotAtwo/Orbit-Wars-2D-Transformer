@@ -1,2 +1,3 @@
 numpy>=1.26
 torch>=2.8,<2.13
+nvidia-cuda-nvcc-cu13>=13.0
