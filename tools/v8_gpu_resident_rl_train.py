@@ -36,6 +36,7 @@ def main() -> None:
     parser.add_argument("--train-batch-requests", type=int, default=512)
     parser.add_argument("--generation-tournament-games", type=int, default=0)
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
+    parser.add_argument("--progress-steps", type=int, default=100)
     parser.add_argument("--bf16", action="store_true")
     args = parser.parse_args()
     run_gpu_resident_rl(args)
@@ -73,6 +74,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         request_players = torch.as_tensor(sim.request_players, device="cuda", dtype=torch.long)
         step_batches: list[ResidentBatchTensorView] = []
         step_fire: list[torch.Tensor] = []
+        progress_interval = max(0, int(args.progress_steps))
         try:
             for step in range(args.steps):
                 view = runtime.decode_model_actions(native_model, sim, step)
@@ -80,6 +82,25 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 step_batches.append(clone_resident_batch(batch))
                 step_fire.append(batch.labels_fire.float().mean().detach())
                 runtime.step_device_actions(sim, step)
+                completed_steps = step + 1
+                if progress_interval > 0 and (
+                    completed_steps % progress_interval == 0
+                    or completed_steps == args.steps
+                ):
+                    elapsed = max(1.0e-6, time.perf_counter() - started)
+                    steps_left = max(0, args.steps - completed_steps)
+                    seconds_per_step = elapsed / completed_steps
+                    print(json.dumps({
+                        "event": "gpu_resident_rl_step_progress",
+                        "generation": generation,
+                        "games": args.games,
+                        "players": args.players,
+                        "step": completed_steps,
+                        "steps": args.steps,
+                        "steps_left": steps_left,
+                        "seconds": round(elapsed, 3),
+                        "eta_seconds": round(seconds_per_step * steps_left, 3),
+                    }), flush=True)
             statuses, stats = runtime.read_status_stats(sim)
             planets, fleets, _next_ids, _state_stats = runtime.read_state(sim)
         finally:
