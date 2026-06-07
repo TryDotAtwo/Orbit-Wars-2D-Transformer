@@ -1,8 +1,8 @@
 {
-  "latest_generation": 7,
+  "latest_generation": 8,
   "total_generations": 32,
-  "updated_at": 1780863740.3542812,
+  "updated_at": 1780864200.3639944,
   "source_run_dir": "/marimo/runs/v8-gpu-resident-rl",
   "latest_model": "molab_checkpoints/v8-gpu-resident-rl/latest_model.bin",
-  "generation_model": "molab_checkpoints/v8-gpu-resident-rl/generation-0007.bin"
+  "generation_model": "molab_checkpoints/v8-gpu-resident-rl/generation-0008.bin"
 }
