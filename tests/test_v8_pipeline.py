@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from tools.leaderboard_v8_dataset import (
     ACTION_SLOTS,
@@ -15,6 +16,8 @@ from tools.leaderboard_v8_dataset import (
 )
 from tools.v8_metrics import compute_action_metrics, match_action_slots
 from tools.v8_model import V8ModelConfig, build_tiny_model, export_model_bin, read_model_bin
+from tools.v8_gpu_policy_loss import compute_resident_policy_loss
+from tools.v8_resident_device_batch import ResidentBatchTensorView
 from tools.v8_selfplay import GeneticRelaxationConfig, mutate_generation
 from tools.v8_train import collate_samples, compute_supervised_loss, write_telemetry
 
@@ -237,6 +240,32 @@ class V8MetricAndModelTests(unittest.TestCase):
 
         self.assertEqual(len(children), 4)
         self.assertEqual(children[0]["parent"], "best.bin")
+
+    def test_resident_policy_loss_ignores_inactive_slot_masked_logits(self):
+        batch = ResidentBatchTensorView(
+            tokens=torch.zeros((1, 2, 3)),
+            token_type_ids=torch.zeros((1, 2), dtype=torch.long),
+            owner_ids=torch.zeros((1, 2), dtype=torch.long),
+            padding_mask=torch.zeros((1, 2), dtype=torch.bool),
+            planet_mask=torch.ones((1, 64), dtype=torch.bool),
+            labels_fire=torch.tensor([[0, 1]], dtype=torch.int32),
+            labels_source=torch.tensor([[-1, 3]], dtype=torch.int32),
+            labels_target=torch.tensor([[-1, 4]], dtype=torch.int32),
+            labels_amount=torch.tensor([[-1, 0]], dtype=torch.int32),
+            labels_confidence=torch.zeros((1, 2)),
+        )
+        outputs = {
+            "fire_logits": torch.tensor([[-2.0, 2.0]]),
+            "source_logits": torch.zeros((1, 2, 64)),
+            "target_logits": torch.zeros((1, 2, 64)),
+            "amount_logits": torch.zeros((1, 2, 16)),
+        }
+        outputs["source_logits"][0, 0, :] = -torch.finfo(torch.float32).max
+        outputs["target_logits"][0, 0, :] = -torch.finfo(torch.float32).max
+
+        loss, _metrics = compute_resident_policy_loss(outputs, batch, torch.tensor([1.0]))
+
+        self.assertTrue(torch.isfinite(loss).item())
 
 
 if __name__ == "__main__":

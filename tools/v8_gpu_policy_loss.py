@@ -79,9 +79,10 @@ def compute_resident_selected_logprob(
         safe_source = labels_source.clamp_min(0)
         safe_target = labels_target.clamp_min(0)
         safe_amount = labels_amount.clamp_min(0)
-        selected_logprob = selected_logprob + active * (
+        active_action_logprob = (
             source_weight * source_logprob.gather(-1, safe_source.unsqueeze(-1)).squeeze(-1)
             + target_weight * target_logprob.gather(-1, safe_target.unsqueeze(-1)).squeeze(-1)
             + amount_weight * amount_logprob.gather(-1, safe_amount.unsqueeze(-1)).squeeze(-1)
         )
+        selected_logprob = selected_logprob + active_action_logprob.masked_fill(~active, 0.0)
     return selected_logprob, labels_fire
