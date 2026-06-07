@@ -213,6 +213,14 @@ class V8CudaRuntime:
             ctypes.POINTER(CudaSimStats),
         ]
         self.lib.orbit_wars_cuda_sim_read_status_stats.restype = CudaStatus
+        self.lib.orbit_wars_cuda_sim_read.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(CudaPlanet),
+            ctypes.POINTER(CudaFleet),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(CudaSimStats),
+        ]
+        self.lib.orbit_wars_cuda_sim_read.restype = CudaStatus
         self.lib.orbit_wars_cuda_sim_read_actions.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(CudaAction),
@@ -376,6 +384,17 @@ class V8CudaRuntime:
             "sim_read_status_stats",
         )
         return list(statuses), list(stats)
+
+    def read_state(self, sim: NativeSim) -> tuple[list[CudaPlanet], list[CudaFleet], list[int], list[CudaSimStats]]:
+        planets = (CudaPlanet * (sim.config.game_count * sim.config.planet_count))()
+        fleets = (CudaFleet * (sim.config.game_count * sim.config.max_fleets_per_game))()
+        next_ids = (ctypes.c_int * sim.config.game_count)()
+        stats = (CudaSimStats * (sim.config.game_count * sim.config.max_players))()
+        self.require(
+            self.lib.orbit_wars_cuda_sim_read(sim.ptr, planets, fleets, next_ids, stats),
+            "sim_read",
+        )
+        return list(planets), list(fleets), [int(value) for value in next_ids], list(stats)
 
 
 def simple_games_host_arrays(

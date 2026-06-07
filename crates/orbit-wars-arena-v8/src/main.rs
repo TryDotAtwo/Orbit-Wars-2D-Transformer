@@ -488,27 +488,6 @@ fn tournament_schedule(model_count: usize, players: usize, games_per_model: usiz
     games
 }
 
-fn grouped_tournament_schedule(model_count: usize, players: usize, games_per_model: usize) -> Vec<Vec<usize>> {
-    let mut games = Vec::new();
-    if model_count == 0 || players == 0 || games_per_model == 0 {
-        return games;
-    }
-    for group in (0..model_count).collect::<Vec<_>>().chunks(players) {
-        if group.len() != players {
-            continue;
-        }
-        for round in 0..games_per_model {
-            let mut participants = group.to_vec();
-            participants.rotate_left(round % players);
-            if round % 2 == 1 {
-                participants.reverse();
-            }
-            games.push(participants);
-        }
-    }
-    games
-}
-
 fn run_cuda_model_tournament(
     models: &[V8Model],
     games_per_model: usize,
@@ -527,11 +506,7 @@ fn run_cuda_model_tournament(
         .iter()
         .map(|model| cuda.create_model(model))
         .collect::<Result<Vec<_>, _>>()?;
-    let schedule = if gpu_sim {
-        grouped_tournament_schedule(models.len(), player_count, games_per_model)
-    } else {
-        tournament_schedule(models.len(), player_count, games_per_model)
-    };
+    let schedule = tournament_schedule(models.len(), player_count, games_per_model);
     let batch_games = if gpu_sim {
         workers.max(games_per_model).max(1).min(schedule.len().max(1))
     } else {

@@ -8,8 +8,10 @@ decode and PyTorch CUDA tensors for policy loss/backprop.
 from __future__ import annotations
 
 import argparse
-import math
 import json
+import math
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
@@ -32,6 +34,8 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--lr", type=float, default=1.0e-5)
     parser.add_argument("--train-batch-requests", type=int, default=512)
+    parser.add_argument("--generation-tournament-games", type=int, default=0)
+    parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
     parser.add_argument("--bf16", action="store_true")
     args = parser.parse_args()
     run_gpu_resident_rl(args)
@@ -57,6 +61,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "steps": args.steps,
         "lr": args.lr,
         "train_batch_requests": args.train_batch_requests,
+        "generation_tournament_games": args.generation_tournament_games,
         "bf16": args.bf16,
     }), flush=True)
 
@@ -76,15 +81,22 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 step_fire.append(batch.labels_fire.float().mean().detach())
                 runtime.step_device_actions(sim, step)
             statuses, stats = runtime.read_status_stats(sim)
+            planets, fleets, _next_ids, _state_stats = runtime.read_state(sim)
         finally:
             runtime.destroy_model(native_model)
             runtime.destroy_sim(sim)
 
-        winners = torch.tensor([status.winner for status in statuses], device="cuda", dtype=torch.long)
-        game_rewards = torch.full((args.games, args.players), -1.0, device="cuda")
-        valid = winners >= 0
-        if valid.any():
-            game_rewards[torch.arange(args.games, device="cuda")[valid], winners[valid]] = 1.0
+        rewards_cpu, margins_cpu = outcome_rewards(
+            statuses,
+            planets,
+            fleets,
+            games=args.games,
+            players=args.players,
+            planet_count=sim.config.planet_count,
+            max_fleets=sim.config.max_fleets_per_game,
+        )
+        game_rewards = torch.as_tensor(rewards_cpu, device="cuda", dtype=torch.float32)
+        valid = torch.tensor([status.winner >= 0 for status in statuses], device="cuda", dtype=torch.bool)
         request_game_ids = torch.arange(args.games, device="cuda", dtype=torch.long).repeat_interleave(args.players)
         request_rewards = game_rewards[request_game_ids, request_players]
         fire_rate = torch.stack(step_fire, dim=0).mean()
@@ -123,6 +135,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         generation_dir = args.run_dir / f"generation-{generation:04d}"
         generation_dir.mkdir(parents=True, exist_ok=True)
         checkpoint = generation_dir / f"checkpoint-generation-{generation:04d}.pt"
+        generation_model_bin = generation_dir / "model.bin"
         torch.save({
             "generation": generation,
             "config": config.__dict__,
@@ -132,9 +145,11 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 "loss": mean_loss,
                 "fire_rate": float(fire_rate.detach().cpu()),
                 "active_slots": mean_active_slots,
+                "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
             },
         }, checkpoint)
-        export_model_bin(model, config, args.run_dir / "model.bin")
+        export_model_bin(model, config, generation_model_bin)
+        shutil.copy2(generation_model_bin, args.run_dir / "model.bin")
         wins = int(valid.sum().detach().cpu())
         draws = int((~valid).sum().detach().cpu())
         elapsed = max(1.0e-6, time.perf_counter() - started)
@@ -149,9 +164,102 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "train_chunks": total_chunks,
             "decisive_games": wins,
             "draws_as_losses": draws,
+            "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
             "checkpoint": str(checkpoint),
+            "generation_model_bin": str(generation_model_bin),
             "model_bin": str(args.run_dir / "model.bin"),
         }), flush=True)
+
+    if args.generation_tournament_games > 0:
+        run_generation_tournament(args)
+
+
+def outcome_rewards(statuses, planets, fleets, *, games: int, players: int, planet_count: int, max_fleets: int) -> tuple[list[list[float]], list[float]]:
+    rewards = [[-0.2 for _ in range(players)] for _ in range(games)]
+    margins: list[float] = []
+    for game in range(games):
+        winner = int(statuses[game].winner)
+        scores = [0.0 for _ in range(players)]
+        planet_base = game * planet_count
+        for row in range(planet_count):
+            planet = planets[planet_base + row]
+            owner = int(planet.owner)
+            if 0 <= owner < players:
+                scores[owner] += math.floor(float(planet.ships))
+        fleet_base = game * max_fleets
+        for row in range(max_fleets):
+            fleet = fleets[fleet_base + row]
+            owner = int(fleet.owner)
+            if int(fleet.alive) and 0 <= owner < players:
+                scores[owner] += math.floor(float(fleet.ships))
+        if winner < 0:
+            margins.append(0.0)
+            continue
+        winner_score = scores[winner]
+        runner_up = max((score for player, score in enumerate(scores) if player != winner), default=0.0)
+        margin = max(0.0, winner_score - runner_up)
+        scale = max(1.0, winner_score + runner_up)
+        bonus = min(0.1, 0.1 * margin / scale)
+        rewards[game][winner] = 1.0 + bonus
+        margins.append(margin)
+    return rewards, margins
+
+
+def run_generation_tournament(args: argparse.Namespace) -> None:
+    model_paths = sorted(args.run_dir.glob("generation-*/model.bin"))
+    if not model_paths:
+        raise RuntimeError(f"no generation model bins in {args.run_dir}")
+    model_list = args.run_dir / "generation_tournament_models.txt"
+    telemetry = args.run_dir / "generation_tournament.json"
+    model_list.write_text("\n".join(str(path) for path in model_paths) + "\n", encoding="utf-8")
+    cmd = [
+        str(args.arena_bin),
+        "--cuda-v8",
+        "--gpu-sim",
+        f"--model-list={model_list}",
+        f"--games-per-model={args.generation_tournament_games}",
+        f"--players={args.players}",
+        f"--workers={max(args.generation_tournament_games, len(model_paths))}",
+        f"--output={telemetry}",
+        "--replay-stride=500",
+    ]
+    print(json.dumps({
+        "event": "generation_tournament_start",
+        "models": len(model_paths),
+        "games_per_model": args.generation_tournament_games,
+        "cmd": cmd,
+    }), flush=True)
+    subprocess.run(cmd, cwd=args.arena_bin.parent.parent.parent, check=True)
+    winner_index, winner_row = read_generation_tournament_winner(telemetry)
+    winner_model = model_paths[winner_index]
+    shutil.copy2(winner_model, args.run_dir / "model.bin")
+    print(json.dumps({
+        "event": "generation_tournament_complete",
+        "winner_index": winner_index,
+        "winner_model": str(winner_model),
+        "winner": winner_row,
+        "model_bin": str(args.run_dir / "model.bin"),
+        "telemetry": str(telemetry),
+    }), flush=True)
+
+
+def read_generation_tournament_winner(path: Path) -> tuple[int, dict]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    rows = data.get("models") or []
+    if not rows:
+        raise RuntimeError(f"generation tournament telemetry has no models: {path}")
+    best_index = 0
+    best_key = None
+    for index, row in enumerate(rows):
+        games = max(1, int(row.get("games", 0)))
+        wins = int(row.get("wins", 0))
+        losses = int(row.get("losses", 0))
+        draws = int(row.get("draws", 0))
+        key = (wins / games, wins - losses - draws, wins, -losses)
+        if best_key is None or key > best_key:
+            best_key = key
+            best_index = index
+    return best_index, rows[best_index]
 
 
 def clone_resident_batch(batch: ResidentBatchTensorView) -> ResidentBatchTensorView:
