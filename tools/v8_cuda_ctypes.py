@@ -64,6 +64,14 @@ class CudaFleet(ctypes.Structure):
     ]
 
 
+class CudaAction(ctypes.Structure):
+    _fields_ = [
+        ("from_planet_id", ctypes.c_int),
+        ("direction_angle", ctypes.c_float),
+        ("ship_count", ctypes.c_int),
+    ]
+
+
 class CudaActionLabel(ctypes.Structure):
     _fields_ = [
         ("fire", ctypes.c_int * 8),
@@ -205,6 +213,12 @@ class V8CudaRuntime:
             ctypes.POINTER(CudaSimStats),
         ]
         self.lib.orbit_wars_cuda_sim_read_status_stats.restype = CudaStatus
+        self.lib.orbit_wars_cuda_sim_read_actions.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(CudaAction),
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        self.lib.orbit_wars_cuda_sim_read_actions.restype = CudaStatus
         self.lib.orbit_wars_cuda_v8_last_batch_device_view.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(DeviceBatchView),
@@ -264,12 +278,12 @@ class V8CudaRuntime:
             ctypes.c_float(0.03),
             ctypes.c_float(100.0),
             ctypes.c_float(50.0),
-            ctypes.c_float(5.0),
+            ctypes.c_float(10.0),
             ctypes.c_float(50.0),
             ctypes.c_float(6.0),
             ctypes.c_float(1000.0),
             ctypes.c_float(1.5),
-            ctypes.c_float(0.3),
+            ctypes.c_float(0.1),
         )
         out = ctypes.c_void_p()
         self.require(self.lib.orbit_wars_cuda_sim_create(config, ctypes.byref(out)), "sim_create")
@@ -298,6 +312,27 @@ class V8CudaRuntime:
             sim.config.planet_count,
             sim.config.max_fleets_per_game,
         )
+        self.load_host_arrays(sim, planets, initial_planets, fleets, next_ids, angular)
+
+    def load_official_like_games(self, sim: NativeSim, *, generation: int = 1) -> None:
+        planets, initial_planets, fleets, next_ids, angular = official_like_games_host_arrays(
+            sim.config.game_count,
+            sim.config.max_players,
+            sim.config.planet_count,
+            sim.config.max_fleets_per_game,
+            generation=generation,
+        )
+        self.load_host_arrays(sim, planets, initial_planets, fleets, next_ids, angular)
+
+    def load_host_arrays(
+        self,
+        sim: NativeSim,
+        planets: np.ndarray,
+        initial_planets: np.ndarray,
+        fleets: np.ndarray,
+        next_ids: np.ndarray,
+        angular: np.ndarray,
+    ) -> None:
         self.require(
             self.lib.orbit_wars_cuda_sim_load_with_angular_velocities(
                 sim.ptr,
@@ -395,3 +430,248 @@ def simple_games_host_arrays(
             planets[base + index] = (-1000 - index, -9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
         initial[base:base + planet_count] = planets[base:base + planet_count]
     return planets, initial, fleets, next_ids, angular
+
+
+MAP_SEED_BASE = 0x4F_57_4D_41_50
+MAP_GENERATION_SEED_FACTOR = 1_000_003
+MAP_GAME_SEED_FACTOR = 9_176
+MAP_RNG_MULTIPLIER = 6_364_136_223_846_793_005
+MAP_RNG_INCREMENT = 1_442_695_040_888_963_407
+MAP_RNG_FLOAT_SCALE = 16_777_216.0
+MAP_GENERATION_ATTEMPT_LIMIT = 5_000
+MAP_MIN_PLANET_GROUPS = 5
+MAP_MAX_PLANET_GROUPS = 10
+MAP_MIN_STATIC_GROUPS = 3
+MAP_PLANET_CLEARANCE = 7.0
+MAP_HOME_PLANET_SHIPS = 10.0
+MAP_STATIC_AXIS_CLEARANCE = 5.0
+MAP_ORBITING_MIN_COORDINATE_OFFSET = 15.0
+MAP_ORBITING_EDGE_CLEARANCE = 5.0
+MAP_SUN_SPAWN_CLEARANCE = 10.0
+MAP_STATIC_SHIP_MIN = 5
+MAP_STATIC_SHIP_MAX = 99
+MAP_ORBITING_SHIP_MIN = 5
+MAP_ORBITING_SHIP_MAX = 30
+MAP_PRODUCTION_MIN = 1
+MAP_PRODUCTION_MAX = 5
+MAP_GROUP_SIZE = 4
+
+
+class MapRng:
+    def __init__(self, seed: int):
+        self.state = seed & 0xFFFF_FFFF_FFFF_FFFF
+
+    def next_u64(self) -> int:
+        self.state = (self.state * MAP_RNG_MULTIPLIER + MAP_RNG_INCREMENT) & 0xFFFF_FFFF_FFFF_FFFF
+        return self.state
+
+    def next_f32(self) -> float:
+        return float(self.next_u64() >> 40) / MAP_RNG_FLOAT_SCALE
+
+    def range_f32(self, low: float, high: float) -> float:
+        return low + (high - low) * self.next_f32()
+
+    def range_usize(self, low: int, high: int) -> int:
+        return low + int(self.next_u64() % (high - low + 1))
+
+
+def official_like_games_host_arrays(
+    games: int,
+    players: int,
+    planet_count: int,
+    max_fleets: int,
+    *,
+    generation: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    planet_dtype = np.dtype([
+        ("id", np.int32),
+        ("owner", np.int32),
+        ("x", np.float32),
+        ("y", np.float32),
+        ("radius", np.float32),
+        ("ships", np.float32),
+        ("production", np.float32),
+        ("velocity_x", np.float32),
+        ("velocity_y", np.float32),
+    ], align=True)
+    fleet_dtype = np.dtype([
+        ("id", np.int32),
+        ("owner", np.int32),
+        ("x", np.float32),
+        ("y", np.float32),
+        ("angle", np.float32),
+        ("from_planet_id", np.int32),
+        ("ships", np.float32),
+        ("alive", np.uint8),
+    ], align=True)
+    if planet_dtype.itemsize != ctypes.sizeof(CudaPlanet):
+        raise RuntimeError(f"bad planet dtype size {planet_dtype.itemsize} != {ctypes.sizeof(CudaPlanet)}")
+    if fleet_dtype.itemsize != ctypes.sizeof(CudaFleet):
+        raise RuntimeError(f"bad fleet dtype size {fleet_dtype.itemsize} != {ctypes.sizeof(CudaFleet)}")
+    if players not in (2, 4):
+        raise ValueError(f"unsupported player count for official-like maps: {players}")
+    planets = np.zeros(games * planet_count, dtype=planet_dtype)
+    initial = np.zeros(games * planet_count, dtype=planet_dtype)
+    fleets = np.zeros(games * max_fleets, dtype=fleet_dtype)
+    next_ids = np.full(games, 1, dtype=np.int32)
+    angular = np.zeros(games, dtype=np.float32)
+    for game in range(games):
+        seed = map_seed(generation, game)
+        rng = MapRng(seed)
+        angular[game] = np.float32(rng.range_f32(0.025, 0.05))
+        rows = generate_official_like_planets(rng)
+        assign_home_planets(rows, players, rng)
+        if len(rows) > planet_count:
+            raise RuntimeError(f"official-like map has too many planets: {len(rows)} > {planet_count}")
+        base = game * planet_count
+        for row, values in enumerate(rows):
+            planets[base + row] = values
+        for row in range(len(rows), planet_count):
+            planets[base + row] = (-1000 - row, -9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        initial[base:base + planet_count] = planets[base:base + planet_count]
+    return planets, initial, fleets, next_ids, angular
+
+
+def map_seed(generation: int, game_index: int) -> int:
+    return MAP_SEED_BASE ^ (generation * MAP_GENERATION_SEED_FACTOR) ^ (game_index * MAP_GAME_SEED_FACTOR)
+
+
+def generate_official_like_planets(rng: MapRng) -> list[tuple[int, int, float, float, float, float, float, float, float]]:
+    target_groups = rng.range_usize(MAP_MIN_PLANET_GROUPS, MAP_MAX_PLANET_GROUPS)
+    target_planets = target_groups * MAP_GROUP_SIZE
+    planets: list[tuple[int, int, float, float, float, float, float, float, float]] = []
+    next_id = 0
+    static_groups = 0
+    for _ in range(MAP_GENERATION_ATTEMPT_LIMIT):
+        if static_groups >= MAP_MIN_STATIC_GROUPS:
+            break
+        group = generate_static_planet_group(next_id, planets, rng)
+        if group is not None:
+            planets.extend(group)
+            next_id += MAP_GROUP_SIZE
+            static_groups += 1
+    attempts = 0
+    has_orbiting = False
+    while len(planets) < target_planets or (not has_orbiting and attempts < MAP_GENERATION_ATTEMPT_LIMIT):
+        attempts += 1
+        if attempts >= MAP_GENERATION_ATTEMPT_LIMIT:
+            break
+        group = generate_orbiting_or_static_planet_group(next_id, planets, rng)
+        if group is None:
+            continue
+        if any(planet_orbits(row) for row in group):
+            has_orbiting = True
+        planets.extend(group)
+        next_id += MAP_GROUP_SIZE
+    if len(planets) < MAP_MIN_PLANET_GROUPS * MAP_GROUP_SIZE:
+        raise RuntimeError("official-like map generation produced too few planets")
+    return planets
+
+
+def generate_static_planet_group(next_id: int, existing: list[tuple], rng: MapRng) -> list[tuple] | None:
+    production = float(rng.range_usize(MAP_PRODUCTION_MIN, MAP_PRODUCTION_MAX))
+    radius = planet_radius_from_production(production)
+    angle = rng.range_f32(0.0, np.pi / 2.0)
+    min_orbital = 50.0 - radius
+    max_orbital = (100.0 - 50.0 - radius) / max(np.cos(angle), np.sin(angle))
+    if min_orbital > max_orbital:
+        return None
+    orbital_radius = rng.range_f32(min_orbital, max_orbital)
+    x = 50.0 + orbital_radius * np.cos(angle)
+    y = 50.0 + orbital_radius * np.sin(angle)
+    if (
+        x + radius > 100.0
+        or x - radius < 0.0
+        or y + radius > 100.0
+        or y - radius < 0.0
+        or x - 50.0 < radius + MAP_STATIC_AXIS_CLEARANCE
+        or y - 50.0 < radius + MAP_STATIC_AXIS_CLEARANCE
+    ):
+        return None
+    ships = float(min(
+        rng.range_usize(MAP_STATIC_SHIP_MIN, MAP_STATIC_SHIP_MAX),
+        rng.range_usize(MAP_STATIC_SHIP_MIN, MAP_STATIC_SHIP_MAX),
+    ))
+    group = symmetric_planet_group(next_id, x, y, radius, ships, production)
+    return group if planet_group_has_clearance(group, existing) else None
+
+
+def generate_orbiting_or_static_planet_group(next_id: int, existing: list[tuple], rng: MapRng) -> list[tuple] | None:
+    production = float(rng.range_usize(MAP_PRODUCTION_MIN, MAP_PRODUCTION_MAX))
+    radius = planet_radius_from_production(production)
+    x = rng.range_f32(50.0 + MAP_ORBITING_MIN_COORDINATE_OFFSET, 100.0 - radius - MAP_ORBITING_EDGE_CLEARANCE)
+    y = rng.range_f32(50.0 + MAP_ORBITING_MIN_COORDINATE_OFFSET, 100.0 - radius - MAP_ORBITING_EDGE_CLEARANCE)
+    orbital_radius = distance_xy(x, y, 50.0, 50.0)
+    if orbital_radius < 5.0 + radius + MAP_SUN_SPAWN_CLEARANCE:
+        return None
+    if orbital_radius + radius >= 50.0 and (
+        x + radius > 100.0 or x - radius < 0.0 or y + radius > 100.0 or y - radius < 0.0
+    ):
+        return None
+    ships = float(rng.range_usize(MAP_ORBITING_SHIP_MIN, MAP_ORBITING_SHIP_MAX))
+    group = symmetric_planet_group(next_id, x, y, radius, ships, production)
+    if planet_group_has_clearance(group, existing) and planet_group_orbit_static_cross_check(group, existing):
+        return group
+    return None
+
+
+def symmetric_planet_group(next_id: int, x: float, y: float, radius: float, ships: float, production: float) -> list[tuple]:
+    return [
+        planet_tuple(next_id, -1, y, x, radius, ships, production),
+        planet_tuple(next_id + 1, -1, 100.0 - x, y, radius, ships, production),
+        planet_tuple(next_id + 2, -1, x, 100.0 - y, radius, ships, production),
+        planet_tuple(next_id + 3, -1, 100.0 - y, 100.0 - x, radius, ships, production),
+    ]
+
+
+def assign_home_planets(planets: list[tuple], players: int, rng: MapRng) -> None:
+    if len(planets) < MAP_GROUP_SIZE or len(planets) % MAP_GROUP_SIZE != 0:
+        raise RuntimeError("home group unavailable")
+    base = rng.range_usize(0, len(planets) // MAP_GROUP_SIZE - 1) * MAP_GROUP_SIZE
+    if players == 2:
+        planets[base] = with_owner_ships(planets[base], 0, MAP_HOME_PLANET_SHIPS)
+        planets[base + 3] = with_owner_ships(planets[base + 3], 1, MAP_HOME_PLANET_SHIPS)
+    else:
+        for player in range(4):
+            planets[base + player] = with_owner_ships(planets[base + player], player, MAP_HOME_PLANET_SHIPS)
+
+
+def planet_tuple(id_value: int, owner: int, x: float, y: float, radius: float, ships: float, production: float) -> tuple:
+    return (id_value, owner, float(x), float(y), float(radius), float(ships), float(production), 0.0, 0.0)
+
+
+def with_owner_ships(row: tuple, owner: int, ships: float) -> tuple:
+    return (row[0], owner, row[2], row[3], row[4], ships, row[6], row[7], row[8])
+
+
+def planet_radius_from_production(production: float) -> float:
+    return 1.0 + float(np.log(production))
+
+
+def planet_orbits(row: tuple) -> bool:
+    return distance_xy(row[2], row[3], 50.0, 50.0) + row[4] < 50.0
+
+
+def planet_group_has_clearance(group: list[tuple], existing: list[tuple]) -> bool:
+    return all(
+        distance_xy(candidate[2], candidate[3], planet[2], planet[3])
+        >= candidate[4] + planet[4] + MAP_PLANET_CLEARANCE
+        for candidate in group
+        for planet in existing
+    )
+
+
+def planet_group_orbit_static_cross_check(group: list[tuple], existing: list[tuple]) -> bool:
+    for candidate in group:
+        for planet in existing:
+            if planet_orbits(candidate) == planet_orbits(planet):
+                continue
+            candidate_orbital = distance_xy(candidate[2], candidate[3], 50.0, 50.0)
+            planet_orbital = distance_xy(planet[2], planet[3], 50.0, 50.0)
+            if abs(candidate_orbital - planet_orbital) < candidate[4] + planet[4] + MAP_PLANET_CLEARANCE:
+                return False
+    return True
+
+
+def distance_xy(left_x: float, left_y: float, right_x: float, right_y: float) -> float:
+    return float(np.hypot(left_x - right_x, left_y - right_y))

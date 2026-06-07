@@ -64,7 +64,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         started = time.perf_counter()
         native_model = runtime.create_model_from_state({key: value.detach().cpu() for key, value in model.state_dict().items()})
         sim = runtime.create_sim(games=args.games, players=args.players, step_limit=args.steps)
-        runtime.load_simple_games(sim)
+        runtime.load_official_like_games(sim, generation=generation)
         request_players = torch.as_tensor(sim.request_players, device="cuda", dtype=torch.long)
         step_batches: list[ResidentBatchTensorView] = []
         step_fire: list[torch.Tensor] = []

@@ -1954,6 +1954,66 @@ __device__ int resident_amount_ships(int amount_index, float source_ships) {
   return static_cast<int>(floorf(fmaxf(fminf(requested, source_ships), 0.0f)));
 }
 
+__device__ bool resident_target_uses_orbit_prediction(
+    const OrbitWarsCudaPlanet& target,
+    const OrbitWarsCudaPlanet* initial_planets,
+    int planet_count,
+    const OrbitWarsCudaSimConfig& config) {
+  for (int index = 0; index < planet_count; ++index) {
+    const OrbitWarsCudaPlanet initial = initial_planets[index];
+    if (initial.id != target.id) continue;
+    const float dx = initial.x - config.board_center;
+    const float dy = initial.y - config.board_center;
+    const float orbital_radius = sqrtf(dx * dx + dy * dy);
+    return orbital_radius + target.radius < config.rotation_radius_limit;
+  }
+  return false;
+}
+
+__device__ void resident_predict_target_position(
+    const OrbitWarsCudaPlanet& target,
+    float travel_time,
+    bool use_orbit_prediction,
+    float angular_velocity,
+    const OrbitWarsCudaSimConfig& config,
+    float* predicted_x,
+    float* predicted_y) {
+  if (use_orbit_prediction) {
+    const float dx = target.x - config.board_center;
+    const float dy = target.y - config.board_center;
+    const float radius = sqrtf(dx * dx + dy * dy);
+    if (radius > 1.19209290e-7f) {
+      const float angle = atan2f(dy, dx) + angular_velocity * travel_time;
+      *predicted_x = config.board_center + radius * cosf(angle);
+      *predicted_y = config.board_center + radius * sinf(angle);
+      return;
+    }
+  }
+  *predicted_x = target.x + target.velocity_x * travel_time;
+  *predicted_y = target.y + target.velocity_y * travel_time;
+}
+
+__device__ float resident_intercept_angle(
+    const OrbitWarsCudaPlanet& source,
+    const OrbitWarsCudaPlanet& target,
+    int ships,
+    bool use_orbit_prediction,
+    float angular_velocity,
+    const OrbitWarsCudaSimConfig& config) {
+  const float speed = sim_fleet_speed(static_cast<float>(ships), config);
+  float predicted_x = target.x;
+  float predicted_y = target.y;
+  for (int iteration = 0; iteration < 128; ++iteration) {
+    const float dx = predicted_x - source.x;
+    const float dy = predicted_y - source.y;
+    const float distance = sqrtf(dx * dx + dy * dy);
+    const float travel_time = distance / speed;
+    resident_predict_target_position(
+        target, travel_time, use_orbit_prediction, angular_velocity, config, &predicted_x, &predicted_y);
+  }
+  return atan2f(predicted_y - source.y, predicted_x - source.x);
+}
+
 __global__ void resident_decode_actions_kernel(
     CudaSimKernelState sim,
     int* request_game_indices,
@@ -2043,9 +2103,15 @@ __global__ void resident_decode_actions_kernel(
     label.target_planet_id[written] = target.id;
     label.ship_count[written] = ships;
     label.confidence[written] = best_fire;
+    OrbitWarsCudaPlanet* initial_planets =
+        sim.initial_planets + static_cast<size_t>(game) * sim.config.planet_count;
+    const float angular_velocity =
+        sim.angular_velocities ? sim.angular_velocities[game] : sim.config.angular_velocity;
+    const bool use_orbit_prediction = resident_target_uses_orbit_prediction(
+        target, initial_planets, static_cast<int>(sim.config.planet_count), sim.config);
     actions[written] = OrbitWarsCudaAction{
         source.id,
-        atan2f(target.y - source.y, target.x - source.x),
+        resident_intercept_angle(source, target, ships, use_orbit_prediction, angular_velocity, sim.config),
         ships};
     used_sources[source_row] = true;
     written += 1;
