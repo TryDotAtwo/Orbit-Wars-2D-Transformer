@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import torch
+from torch import nn
 
 from tools.v8_cuda_ctypes import V8CudaRuntime
 from tools.v8_gpu_policy_loss import compute_resident_policy_loss
@@ -37,6 +38,7 @@ def main() -> None:
     parser.add_argument("--generation-tournament-games", type=int, default=0)
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
     parser.add_argument("--progress-steps", type=int, default=100)
+    parser.add_argument("--debug-nan", action="store_true")
     parser.add_argument("--bf16", action="store_true")
     args = parser.parse_args()
     run_gpu_resident_rl(args)
@@ -63,6 +65,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "train_batch_requests": args.train_batch_requests,
         "generation_tournament_games": args.generation_tournament_games,
+        "debug_nan": args.debug_nan,
         "bf16": args.bf16,
     }), flush=True)
 
@@ -127,8 +130,10 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         )
         loss_total = 0.0
         active_slots_total = 0.0
+        finite_chunks = 0
+        skipped_nan_chunks = 0
         optimizer.zero_grad(set_to_none=True)
-        for batch in step_batches:
+        for batch_index, batch in enumerate(step_batches):
             request_count = int(batch.tokens.shape[0])
             for start in range(0, request_count, args.train_batch_requests):
                 stop = min(start + args.train_batch_requests, request_count)
@@ -143,15 +148,41 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                         planet_mask=mini.planet_mask,
                     )
                     loss, metrics = compute_resident_policy_loss(outputs, mini, mini_rewards)
+                if args.debug_nan and not torch.isfinite(loss).item():
+                    skipped_nan_chunks += 1
+                    print(json.dumps(nan_debug_payload(
+                        generation=generation,
+                        batch_index=batch_index,
+                        chunk_start=start,
+                        chunk_stop=stop,
+                        outputs=outputs,
+                        batch=mini,
+                        rewards=mini_rewards,
+                        loss=loss,
+                    )), flush=True)
+                    continue
                 (loss / max(1, total_chunks)).backward()
                 loss_total += float(loss.detach().cpu())
                 active_slots_total += float(metrics["active_slots"])
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+                finite_chunks += 1
+        grad_debug = gradient_debug_payload(model) if args.debug_nan else None
+        if args.debug_nan and grad_debug is not None:
+            print(json.dumps({
+                "event": "gpu_resident_rl_grad_debug",
+                "generation": generation,
+                **grad_debug,
+            }), flush=True)
+        if args.debug_nan and grad_debug is not None and grad_debug["bad_tensors"] > 0:
+            optimizer.zero_grad(set_to_none=True)
+            update_applied = False
+        else:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            update_applied = True
         del step_batches
         torch.cuda.synchronize()
-        mean_loss = loss_total / max(1, total_chunks)
-        mean_active_slots = active_slots_total / max(1, total_chunks)
+        mean_loss = loss_total / max(1, finite_chunks)
+        mean_active_slots = active_slots_total / max(1, finite_chunks)
 
         generation_dir = args.run_dir / f"generation-{generation:04d}"
         generation_dir.mkdir(parents=True, exist_ok=True)
@@ -167,6 +198,9 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 "fire_rate": float(fire_rate.detach().cpu()),
                 "active_slots": mean_active_slots,
                 "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
+                "finite_chunks": finite_chunks,
+                "skipped_nan_chunks": skipped_nan_chunks,
+                "update_applied": update_applied,
             },
         }, checkpoint)
         export_model_bin(model, config, generation_model_bin)
@@ -183,6 +217,9 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "fire_rate": float(fire_rate.detach().cpu()),
             "active_slots": mean_active_slots,
             "train_chunks": total_chunks,
+            "finite_chunks": finite_chunks,
+            "skipped_nan_chunks": skipped_nan_chunks,
+            "update_applied": update_applied,
             "decisive_games": wins,
             "draws_as_losses": draws,
             "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
@@ -281,6 +318,157 @@ def read_generation_tournament_winner(path: Path) -> tuple[int, dict]:
             best_key = key
             best_index = index
     return best_index, rows[best_index]
+
+
+def nan_debug_payload(
+    *,
+    generation: int,
+    batch_index: int,
+    chunk_start: int,
+    chunk_stop: int,
+    outputs: dict[str, torch.Tensor],
+    batch: ResidentBatchTensorView,
+    rewards: torch.Tensor,
+    loss: torch.Tensor,
+) -> dict:
+    return {
+        "event": "gpu_resident_rl_nan_debug",
+        "generation": generation,
+        "batch_index": batch_index,
+        "chunk_start": chunk_start,
+        "chunk_stop": chunk_stop,
+        "loss": scalar_debug(loss),
+        "rewards": tensor_debug(rewards),
+        "outputs": {name: tensor_debug(value) for name, value in outputs.items()},
+        "labels": {
+            "fire": tensor_debug(batch.labels_fire),
+            "source": tensor_debug(batch.labels_source),
+            "target": tensor_debug(batch.labels_target),
+            "amount": tensor_debug(batch.labels_amount),
+            "confidence": tensor_debug(batch.labels_confidence),
+        },
+        "loss_parts": policy_loss_parts_debug(outputs, batch, rewards),
+    }
+
+
+def policy_loss_parts_debug(
+    outputs: dict[str, torch.Tensor],
+    batch: ResidentBatchTensorView,
+    rewards: torch.Tensor,
+) -> dict:
+    device = outputs["fire_logits"].device
+    labels_fire = batch.labels_fire.to(device=device, dtype=torch.float32)
+    labels_source = batch.labels_source.to(device=device, dtype=torch.long).clamp(
+        min=0,
+        max=max(0, int(outputs["source_logits"].shape[-1]) - 1),
+    )
+    labels_target = batch.labels_target.to(device=device, dtype=torch.long).clamp(
+        min=0,
+        max=max(0, int(outputs["target_logits"].shape[-1]) - 1),
+    )
+    labels_amount = batch.labels_amount.to(device=device, dtype=torch.long).clamp(
+        min=0,
+        max=max(0, int(outputs["amount_logits"].shape[-1]) - 1),
+    )
+    rewards = rewards.to(device=device, dtype=torch.float32)
+    if rewards.ndim == 1:
+        rewards = rewards[:, None].expand_as(labels_fire)
+    active = labels_fire > 0.5
+
+    fire_logprob = -nn.functional.binary_cross_entropy_with_logits(
+        outputs["fire_logits"],
+        labels_fire,
+        reduction="none",
+    )
+    parts = {
+        "fire": scalar_debug(-(rewards * 0.35 * fire_logprob).mean()),
+        "active_slots": int(active.sum().detach().cpu()),
+    }
+    if active.any():
+        source_logprob = outputs["source_logits"].log_softmax(dim=-1)
+        target_logprob = outputs["target_logits"].log_softmax(dim=-1)
+        amount_logprob = outputs["amount_logits"].log_softmax(dim=-1)
+        parts.update({
+            "source": scalar_debug(-(
+                rewards
+                * active
+                * source_logprob.gather(-1, labels_source.unsqueeze(-1)).squeeze(-1)
+            ).mean()),
+            "target": scalar_debug(-(
+                rewards
+                * active
+                * target_logprob.gather(-1, labels_target.unsqueeze(-1)).squeeze(-1)
+            ).mean()),
+            "amount": scalar_debug(-(
+                rewards
+                * active
+                * 0.75
+                * amount_logprob.gather(-1, labels_amount.unsqueeze(-1)).squeeze(-1)
+            ).mean()),
+        })
+    return parts
+
+
+def gradient_debug_payload(model: torch.nn.Module) -> dict:
+    total_sq = 0.0
+    max_abs = 0.0
+    bad_tensors = 0
+    bad_names: list[str] = []
+    tensor_count = 0
+    for name, parameter in model.named_parameters():
+        grad = parameter.grad
+        if grad is None:
+            continue
+        tensor_count += 1
+        finite = torch.isfinite(grad)
+        if not finite.all().item():
+            bad_tensors += 1
+            if len(bad_names) < 16:
+                bad_names.append(name)
+            finite_grad = grad[finite]
+        else:
+            finite_grad = grad
+        if finite_grad.numel() == 0:
+            continue
+        total_sq += float(finite_grad.detach().float().pow(2).sum().cpu())
+        max_abs = max(max_abs, float(finite_grad.detach().float().abs().max().cpu()))
+    return {
+        "tensors": tensor_count,
+        "bad_tensors": bad_tensors,
+        "bad_names": bad_names,
+        "global_norm": math.sqrt(total_sq),
+        "max_abs": max_abs,
+    }
+
+
+def tensor_debug(value: torch.Tensor) -> dict:
+    detached = value.detach()
+    finite = torch.isfinite(detached) if detached.is_floating_point() or detached.is_complex() else torch.ones_like(detached, dtype=torch.bool)
+    finite_count = int(finite.sum().cpu())
+    total = detached.numel()
+    payload = {
+        "shape": list(detached.shape),
+        "dtype": str(detached.dtype),
+        "finite": finite_count,
+        "total": total,
+        "nan": int(torch.isnan(detached).sum().cpu()) if detached.is_floating_point() else 0,
+        "inf": int(torch.isinf(detached).sum().cpu()) if detached.is_floating_point() else 0,
+    }
+    if total > 0 and finite_count > 0:
+        finite_values = detached[finite].float()
+        payload.update({
+            "min": float(finite_values.min().cpu()),
+            "max": float(finite_values.max().cpu()),
+            "mean": float(finite_values.mean().cpu()),
+        })
+    return payload
+
+
+def scalar_debug(value: torch.Tensor) -> dict:
+    debug = tensor_debug(value.reshape(()))
+    if debug["finite"] == 1:
+        debug["value"] = float(value.detach().float().cpu())
+    return debug
 
 
 def clone_resident_batch(batch: ResidentBatchTensorView) -> ResidentBatchTensorView:
