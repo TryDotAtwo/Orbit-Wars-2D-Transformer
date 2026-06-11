@@ -1,11 +1,11 @@
 {
   "run_name": "v8-gpu-resident-ppo-baseline-v1",
-  "latest_generation": 21,
+  "latest_generation": 22,
   "total_generations": 32,
-  "updated_at": 1781219620.5777853,
+  "updated_at": 1781220105.344096,
   "source_run_dir": "/marimo/runs/v8-gpu-resident-ppo-baseline-v1",
   "latest_model": "molab_checkpoints/v8-gpu-resident-ppo-baseline-v1/latest_model.bin",
-  "generation_model": "molab_checkpoints/v8-gpu-resident-ppo-baseline-v1/generation-0021.bin",
+  "generation_model": "molab_checkpoints/v8-gpu-resident-ppo-baseline-v1/generation-0022.bin",
   "training": {
     "mode": "gpu_resident_ppo_baseline",
     "games": 512,
