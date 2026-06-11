@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from tools.v8_cuda_ctypes import V8CudaRuntime
-from tools.v8_gpu_policy_loss import compute_resident_policy_loss
+from tools.v8_gpu_policy_loss import compute_resident_policy_loss, compute_resident_selected_logprob
 from tools.v8_model import V8ActionSlotTransformer, export_model_bin, load_model_bin_state
 from tools.v8_resident_device_batch import ResidentBatchTensorView, resident_batch_view_to_tensors
 
@@ -27,6 +27,7 @@ from tools.v8_resident_device_batch import ResidentBatchTensorView, resident_bat
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model-bin", type=Path, required=True)
+    parser.add_argument("--baseline-model-bin", type=Path, default=None)
     parser.add_argument("--cuda-lib", type=Path, default=Path("target/liborbit_wars_v8_cuda.so"))
     parser.add_argument("--run-dir", type=Path, default=Path("runs/v8-gpu-resident-rl"))
     parser.add_argument("--generations", type=int, default=4)
@@ -36,6 +37,9 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=1.0e-5)
     parser.add_argument("--train-batch-requests", type=int, default=512)
     parser.add_argument("--generation-tournament-games", type=int, default=0)
+    parser.add_argument("--baseline-players", type=int, default=2)
+    parser.add_argument("--ppo-clip", type=float, default=0.2)
+    parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
     parser.add_argument("--progress-steps", type=int, default=100)
     parser.add_argument("--debug-nan", action="store_true")
@@ -48,14 +52,24 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
     args.run_dir.mkdir(parents=True, exist_ok=True)
     config, state = load_model_bin_state(args.base_model_bin)
     model = V8ActionSlotTransformer(config).cuda()
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    baseline_config = None
+    baseline_state = None
+    baseline_model_bin = args.baseline_model_bin
+    if baseline_model_bin is None and args.baseline_players > 0:
+        baseline_model_bin = args.base_model_bin
+    if baseline_model_bin is not None and args.baseline_players > 0:
+        baseline_config, baseline_state = load_model_bin_state(baseline_model_bin)
+        if baseline_config != config:
+            raise ValueError(f"baseline config mismatch: {baseline_config} != {config}")
     runtime = V8CudaRuntime(args.cuda_lib)
     runtime.status()
     print(json.dumps({
         "event": "gpu_resident_rl_start",
         "base_model": str(args.base_model_bin),
+        "baseline_model": str(baseline_model_bin) if baseline_model_bin else None,
         "cuda_lib": str(args.cuda_lib),
         "run_dir": str(args.run_dir),
         "generations": args.generations,
@@ -65,6 +79,9 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "lr": args.lr,
         "train_batch_requests": args.train_batch_requests,
         "generation_tournament_games": args.generation_tournament_games,
+        "baseline_players": args.baseline_players,
+        "ppo_clip": args.ppo_clip,
+        "ppo_epochs": args.ppo_epochs,
         "debug_nan": args.debug_nan,
         "bf16": args.bf16,
     }), flush=True)
@@ -72,18 +89,54 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
     for generation in range(1, args.generations + 1):
         started = time.perf_counter()
         native_model = runtime.create_model_from_state({key: value.detach().cpu() for key, value in model.state_dict().items()})
+        native_baseline_model = None
+        if baseline_state is not None:
+            native_baseline_model = runtime.create_model_from_state(baseline_state)
         sim = runtime.create_sim(games=args.games, players=args.players, step_limit=args.steps)
         runtime.load_official_like_games(sim, generation=generation)
-        request_players = torch.as_tensor(sim.request_players, device="cuda", dtype=torch.long)
+        baseline_player_count = min(max(0, int(args.baseline_players)), max(0, args.players - 1))
+        current_player_count = args.players - baseline_player_count if native_baseline_model is not None else args.players
+        current_mask = sim.request_players < current_player_count
+        baseline_mask = ~current_mask
+        current_request_games = sim.request_games[current_mask]
+        current_request_players = sim.request_players[current_mask]
+        baseline_request_games = sim.request_games[baseline_mask]
+        baseline_request_players = sim.request_players[baseline_mask]
+        request_players = torch.as_tensor(current_request_players, device="cuda", dtype=torch.long)
         step_batches: list[ResidentBatchTensorView] = []
         step_fire: list[torch.Tensor] = []
         progress_interval = max(0, int(args.progress_steps))
         try:
             for step in range(args.steps):
-                view = runtime.decode_model_actions(native_model, sim, step)
+                runtime.require(runtime.lib.orbit_wars_cuda_sim_clear_actions(sim.ptr), "sim_clear_actions")
+                view = runtime.decode_model_actions_for_requests(
+                    native_model,
+                    sim,
+                    step,
+                    current_request_games,
+                    current_request_players,
+                )
                 batch = resident_batch_view_to_tensors(view)
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.bf16)):
+                    old_outputs = model(
+                        batch.tokens,
+                        batch.token_type_ids,
+                        batch.owner_ids,
+                        padding_mask=batch.padding_mask,
+                        planet_mask=batch.planet_mask,
+                    )
+                    old_logprob, _old_labels_fire = compute_resident_selected_logprob(old_outputs, batch)
+                batch = attach_old_logprob(batch, old_logprob.detach())
                 step_batches.append(clone_resident_batch(batch))
                 step_fire.append(batch.labels_fire.float().mean().detach())
+                if native_baseline_model is not None and baseline_request_games.size > 0:
+                    runtime.decode_model_actions_for_requests(
+                        native_baseline_model,
+                        sim,
+                        step,
+                        baseline_request_games,
+                        baseline_request_players,
+                    )
                 runtime.step_device_actions(sim, step)
                 completed_steps = step + 1
                 if progress_interval > 0 and (
@@ -108,6 +161,8 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             planets, fleets, _next_ids, _state_stats = runtime.read_state(sim)
         finally:
             runtime.destroy_model(native_model)
+            if native_baseline_model is not None:
+                runtime.destroy_model(native_baseline_model)
             runtime.destroy_sim(sim)
 
         rewards_cpu, margins_cpu = outcome_rewards(
@@ -120,51 +175,81 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             max_fleets=sim.config.max_fleets_per_game,
         )
         game_rewards = torch.as_tensor(rewards_cpu, device="cuda", dtype=torch.float32)
+        current_wins = 0
+        baseline_wins = 0
+        other_results = 0
+        for status in statuses:
+            winner = int(status.winner)
+            if 0 <= winner < current_player_count:
+                current_wins += 1
+            elif native_baseline_model is not None and current_player_count <= winner < args.players:
+                baseline_wins += 1
+            else:
+                other_results += 1
         valid = torch.tensor([status.winner >= 0 for status in statuses], device="cuda", dtype=torch.bool)
-        request_game_ids = torch.arange(args.games, device="cuda", dtype=torch.long).repeat_interleave(args.players)
+        request_game_ids = torch.as_tensor(current_request_games, device="cuda", dtype=torch.long)
         request_rewards = game_rewards[request_game_ids, request_players]
         fire_rate = torch.stack(step_fire, dim=0).mean()
-        total_chunks = sum(
+        ppo_epochs = max(1, int(args.ppo_epochs))
+        total_chunks = ppo_epochs * sum(
             math.ceil(int(batch.tokens.shape[0]) / max(1, args.train_batch_requests))
             for batch in step_batches
         )
         loss_total = 0.0
         active_slots_total = 0.0
+        policy_loss_total = 0.0
+        value_loss_total = 0.0
+        invalid_loss_total = 0.0
+        approx_kl_total = 0.0
+        clip_fraction_total = 0.0
+        invalid_slots_total = 0.0
         finite_chunks = 0
         skipped_nan_chunks = 0
         optimizer.zero_grad(set_to_none=True)
-        for batch_index, batch in enumerate(step_batches):
-            request_count = int(batch.tokens.shape[0])
-            for start in range(0, request_count, args.train_batch_requests):
-                stop = min(start + args.train_batch_requests, request_count)
-                mini = slice_resident_batch(batch, start, stop)
-                mini_rewards = request_rewards[start:stop]
-                with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.bf16)):
-                    outputs = model(
-                        mini.tokens,
-                        mini.token_type_ids,
-                        mini.owner_ids,
-                        padding_mask=mini.padding_mask,
-                        planet_mask=mini.planet_mask,
-                    )
-                    loss, metrics = compute_resident_policy_loss(outputs, mini, mini_rewards)
-                if args.debug_nan and not torch.isfinite(loss).item():
-                    skipped_nan_chunks += 1
-                    print(json.dumps(nan_debug_payload(
-                        generation=generation,
-                        batch_index=batch_index,
-                        chunk_start=start,
-                        chunk_stop=stop,
-                        outputs=outputs,
-                        batch=mini,
-                        rewards=mini_rewards,
-                        loss=loss,
-                    )), flush=True)
-                    continue
-                (loss / max(1, total_chunks)).backward()
-                loss_total += float(loss.detach().cpu())
-                active_slots_total += float(metrics["active_slots"])
-                finite_chunks += 1
+        for ppo_epoch in range(ppo_epochs):
+            for batch_index, batch in enumerate(step_batches):
+                request_count = int(batch.tokens.shape[0])
+                for start in range(0, request_count, args.train_batch_requests):
+                    stop = min(start + args.train_batch_requests, request_count)
+                    mini = slice_resident_batch(batch, start, stop)
+                    mini_rewards = request_rewards[start:stop]
+                    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=bool(args.bf16)):
+                        outputs = model(
+                            mini.tokens,
+                            mini.token_type_ids,
+                            mini.owner_ids,
+                            padding_mask=mini.padding_mask,
+                            planet_mask=mini.planet_mask,
+                        )
+                        loss, metrics = compute_resident_policy_loss(
+                            outputs,
+                            mini,
+                            mini_rewards,
+                            ppo_clip=args.ppo_clip,
+                        )
+                    if args.debug_nan and not torch.isfinite(loss).item():
+                        skipped_nan_chunks += 1
+                        print(json.dumps(nan_debug_payload(
+                            generation=generation,
+                            batch_index=batch_index,
+                            chunk_start=start,
+                            chunk_stop=stop,
+                            outputs=outputs,
+                            batch=mini,
+                            rewards=mini_rewards,
+                            loss=loss,
+                        )), flush=True)
+                        continue
+                    (loss / max(1, total_chunks)).backward()
+                    loss_total += float(loss.detach().cpu())
+                    active_slots_total += float(metrics["active_slots"])
+                    policy_loss_total += float(metrics["policy_loss"])
+                    value_loss_total += float(metrics["value_loss"])
+                    invalid_loss_total += float(metrics["invalid_loss"])
+                    approx_kl_total += float(metrics["approx_kl"])
+                    clip_fraction_total += float(metrics["clip_fraction"])
+                    invalid_slots_total += float(metrics["invalid_slots"])
+                    finite_chunks += 1
         grad_debug = gradient_debug_payload(model) if args.debug_nan else None
         if args.debug_nan and grad_debug is not None:
             print(json.dumps({
@@ -183,6 +268,12 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         torch.cuda.synchronize()
         mean_loss = loss_total / max(1, finite_chunks)
         mean_active_slots = active_slots_total / max(1, finite_chunks)
+        mean_policy_loss = policy_loss_total / max(1, finite_chunks)
+        mean_value_loss = value_loss_total / max(1, finite_chunks)
+        mean_invalid_loss = invalid_loss_total / max(1, finite_chunks)
+        mean_approx_kl = approx_kl_total / max(1, finite_chunks)
+        mean_clip_fraction = clip_fraction_total / max(1, finite_chunks)
+        mean_invalid_slots = invalid_slots_total / max(1, finite_chunks)
 
         generation_dir = args.run_dir / f"generation-{generation:04d}"
         generation_dir.mkdir(parents=True, exist_ok=True)
@@ -195,16 +286,29 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "optimizer": optimizer.state_dict(),
             "metrics": {
                 "loss": mean_loss,
+                "policy_loss": mean_policy_loss,
+                "value_loss": mean_value_loss,
+                "invalid_loss": mean_invalid_loss,
+                "approx_kl": mean_approx_kl,
+                "clip_fraction": mean_clip_fraction,
+                "invalid_slots": mean_invalid_slots,
                 "fire_rate": float(fire_rate.detach().cpu()),
                 "active_slots": mean_active_slots,
                 "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
                 "finite_chunks": finite_chunks,
                 "skipped_nan_chunks": skipped_nan_chunks,
                 "update_applied": update_applied,
+                "ppo_clip": args.ppo_clip,
+                "ppo_epochs": ppo_epochs,
             },
         }, checkpoint)
         export_model_bin(model, config, generation_model_bin)
         shutil.copy2(generation_model_bin, args.run_dir / "model.bin")
+        baseline_updated = False
+        if baseline_state is not None and current_wins > baseline_wins:
+            baseline_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+            baseline_model_bin = generation_model_bin
+            baseline_updated = True
         wins = int(valid.sum().detach().cpu())
         draws = int((~valid).sum().detach().cpu())
         elapsed = max(1.0e-6, time.perf_counter() - started)
@@ -214,14 +318,26 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "seconds": round(elapsed, 3),
             "games_per_second": round(args.games / elapsed, 3),
             "loss": mean_loss,
+            "policy_loss": mean_policy_loss,
+            "value_loss": mean_value_loss,
+            "invalid_loss": mean_invalid_loss,
+            "approx_kl": mean_approx_kl,
+            "clip_fraction": mean_clip_fraction,
+            "invalid_slots": mean_invalid_slots,
             "fire_rate": float(fire_rate.detach().cpu()),
             "active_slots": mean_active_slots,
             "train_chunks": total_chunks,
+            "ppo_epochs": ppo_epochs,
+            "ppo_clip": args.ppo_clip,
             "finite_chunks": finite_chunks,
             "skipped_nan_chunks": skipped_nan_chunks,
             "update_applied": update_applied,
             "decisive_games": wins,
             "draws_as_losses": draws,
+            "current_model_wins": current_wins,
+            "baseline_model_wins": baseline_wins,
+            "baseline_updated": baseline_updated,
+            "other_results": other_results,
             "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
             "checkpoint": str(checkpoint),
             "generation_model_bin": str(generation_model_bin),
@@ -483,6 +599,7 @@ def clone_resident_batch(batch: ResidentBatchTensorView) -> ResidentBatchTensorV
         labels_target=batch.labels_target.detach().clone(),
         labels_amount=batch.labels_amount.detach().clone(),
         labels_confidence=batch.labels_confidence.detach().clone(),
+        old_logprob=batch.old_logprob.detach().clone() if batch.old_logprob is not None else None,
     )
 
 
@@ -498,6 +615,23 @@ def slice_resident_batch(batch: ResidentBatchTensorView, start: int, stop: int) 
         labels_target=batch.labels_target[start:stop],
         labels_amount=batch.labels_amount[start:stop],
         labels_confidence=batch.labels_confidence[start:stop],
+        old_logprob=batch.old_logprob[start:stop] if batch.old_logprob is not None else None,
+    )
+
+
+def attach_old_logprob(batch: ResidentBatchTensorView, old_logprob: torch.Tensor) -> ResidentBatchTensorView:
+    return ResidentBatchTensorView(
+        tokens=batch.tokens,
+        token_type_ids=batch.token_type_ids,
+        owner_ids=batch.owner_ids,
+        padding_mask=batch.padding_mask,
+        planet_mask=batch.planet_mask,
+        labels_fire=batch.labels_fire,
+        labels_source=batch.labels_source,
+        labels_target=batch.labels_target,
+        labels_amount=batch.labels_amount,
+        labels_confidence=batch.labels_confidence,
+        old_logprob=old_logprob,
     )
 
 

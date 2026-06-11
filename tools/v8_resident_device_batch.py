@@ -21,6 +21,7 @@ class ResidentBatchTensorView:
     labels_target: torch.Tensor
     labels_amount: torch.Tensor
     labels_confidence: torch.Tensor
+    old_logprob: torch.Tensor | None = None
 
     @property
     def request_count(self) -> int:
@@ -61,4 +62,3 @@ def resident_batch_view_to_tensors(view: Any) -> ResidentBatchTensorView:
         labels_amount=cuda_tensor_from_ptr(int(view.labels_amount), (requests, slots), "int32"),
         labels_confidence=cuda_tensor_from_ptr(int(view.labels_confidence), (requests, slots), "float32"),
     )
-

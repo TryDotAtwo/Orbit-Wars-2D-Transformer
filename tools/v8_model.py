@@ -61,6 +61,10 @@ class V8ActionSlotTransformer(nn.Module):
         self.source_head = nn.Linear(config.d_model, config.max_planets)
         self.target_head = nn.Linear(config.d_model, config.max_planets)
         self.amount_head = nn.Linear(config.d_model, config.amount_classes)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(config.d_model),
+            nn.Linear(config.d_model, 1),
+        )
 
     def forward(
         self,
@@ -76,6 +80,11 @@ class V8ActionSlotTransformer(nn.Module):
         hidden = hidden + self.type_embedding(token_type_ids.clamp(min=0, max=2))
         hidden = hidden + self.owner_embedding(owner_ids)
         encoded = self.encoder(hidden, src_key_padding_mask=padding_mask)
+        if padding_mask is None:
+            pooled = encoded.mean(dim=1)
+        else:
+            valid = (~padding_mask.bool()).to(encoded.dtype)
+            pooled = (encoded * valid.unsqueeze(-1)).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
         queries = self.slot_queries.unsqueeze(0).expand(tokens.shape[0], -1, -1)
         slots = self.decoder(queries, encoded, memory_key_padding_mask=padding_mask)
         source_logits = self.source_head(slots)
@@ -90,6 +99,7 @@ class V8ActionSlotTransformer(nn.Module):
             "source_logits": source_logits,
             "target_logits": target_logits,
             "amount_logits": self.amount_head(slots),
+            "value": self.value_head(pooled).squeeze(-1),
         }
 
 

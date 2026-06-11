@@ -57,7 +57,7 @@ def main() -> None:
     args = parser.parse_args()
     config, state = load_model_bin_state(args.model_bin)
     model = V8ActionSlotTransformer(config)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     telemetry = run_gpu_selfplay(
         model,
         output_path=args.output,

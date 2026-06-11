@@ -668,7 +668,7 @@ def crossover_state(
 
 def export_state_dict(state: dict[str, torch.Tensor], config: V8ModelConfig, path: Path) -> None:
     model = V8ActionSlotTransformer(config)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     model.eval()
     export_model_bin(model, config, path)
 
@@ -685,7 +685,7 @@ def run_gpu_candidate(
 ) -> None:
     started = time.perf_counter()
     model = V8ActionSlotTransformer(config)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     run_gpu_selfplay(
         model,
         output_path=telemetry_path,
@@ -1118,7 +1118,7 @@ def backprop_on_selfplay(
     if device.startswith("cuda"):
         torch.set_float32_matmul_precision("high")
     model = V8ActionSlotTransformer(model_config).to(device)
-    model.load_state_dict(state)
+    model.load_state_dict(state, strict=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.backprop_lr, weight_decay=0.01)
     use_bf16 = device.startswith("cuda")
     if optimizer_state:

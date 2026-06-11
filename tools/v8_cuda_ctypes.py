@@ -353,15 +353,36 @@ class V8CudaRuntime:
             "sim_load_with_angular_velocities",
         )
 
-    def decode_model_actions(self, model: NativeModel, sim: NativeSim, step: int) -> DeviceBatchView:
-        self.require(self.lib.orbit_wars_cuda_sim_clear_actions(sim.ptr), "sim_clear_actions")
+    def decode_model_actions(self, model: NativeModel, sim: NativeSim, step: int, *, clear_actions: bool = True) -> DeviceBatchView:
+        if clear_actions:
+            self.require(self.lib.orbit_wars_cuda_sim_clear_actions(sim.ptr), "sim_clear_actions")
+        return self.decode_model_actions_for_requests(
+            model,
+            sim,
+            step,
+            sim.request_games,
+            sim.request_players,
+        )
+
+    def decode_model_actions_for_requests(
+        self,
+        model: NativeModel,
+        sim: NativeSim,
+        step: int,
+        request_games: np.ndarray,
+        request_players: np.ndarray,
+    ) -> DeviceBatchView:
+        request_games = np.ascontiguousarray(request_games, dtype=np.int32)
+        request_players = np.ascontiguousarray(request_players, dtype=np.int32)
+        if request_games.shape != request_players.shape:
+            raise ValueError(f"request plan shape mismatch: {request_games.shape} != {request_players.shape}")
         self.require(
             self.lib.orbit_wars_cuda_v8_resident_model_decode(
                 model.ptr,
                 sim.ptr,
-                sim.request_games.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                sim.request_players.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
-                sim.request_games.size,
+                request_games.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                request_players.ctypes.data_as(ctypes.POINTER(ctypes.c_int)),
+                request_games.size,
                 step,
             ),
             "resident_model_decode",

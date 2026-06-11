@@ -16,6 +16,9 @@ def compute_resident_policy_loss(
     target_weight: float = 1.0,
     amount_weight: float = 0.75,
     fire_weight: float = 0.35,
+    value_weight: float = 0.5,
+    invalid_action_weight: float = 3.0,
+    ppo_clip: float = 0.2,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute policy loss fully on CUDA tensors.
 
@@ -38,14 +41,60 @@ def compute_resident_policy_loss(
     if rewards.shape != labels_fire.shape:
         raise ValueError(f"bad rewards shape {tuple(rewards.shape)} expected {tuple(labels_fire.shape)}")
 
-    # Policy gradient objective: minimize -reward * logprob.
-    loss = -(rewards * selected_logprob).mean()
+    values = outputs.get("value")
+    if values is None:
+        advantages = rewards
+        value_loss = selected_logprob.new_zeros(())
+        mean_value = selected_logprob.new_zeros(())
+    else:
+        values = values.to(device=device, dtype=torch.float32)
+        if values.ndim != 1 or values.shape[0] != labels_fire.shape[0]:
+            raise ValueError(f"bad value shape {tuple(values.shape)} expected {(labels_fire.shape[0],)}")
+        request_rewards = rewards.mean(dim=1)
+        advantages = rewards - values.detach()[:, None]
+        value_loss = nn.functional.mse_loss(values, request_rewards)
+        mean_value = values.detach().mean()
+
+    invalid_mask = batch.labels_confidence.to(device=device, dtype=torch.float32) < 0.0
+    invalid_loss = selected_logprob.new_zeros(())
+    if invalid_mask.any():
+        invalid_fire = nn.functional.binary_cross_entropy_with_logits(
+            outputs["fire_logits"].float(),
+            torch.zeros_like(outputs["fire_logits"], dtype=torch.float32),
+            reduction="none",
+        )
+        invalid_loss = invalid_fire.masked_select(invalid_mask).mean()
+
+    old_logprob = batch.old_logprob
+    if old_logprob is None:
+        old_logprob = selected_logprob.detach()
+    else:
+        old_logprob = old_logprob.to(device=device, dtype=torch.float32)
+        if old_logprob.shape != selected_logprob.shape:
+            raise ValueError(f"bad old_logprob shape {tuple(old_logprob.shape)} expected {tuple(selected_logprob.shape)}")
+    log_ratio = selected_logprob - old_logprob.detach()
+    ratio = log_ratio.clamp(min=-20.0, max=20.0).exp()
+    clipped_ratio = ratio.clamp(1.0 - ppo_clip, 1.0 + ppo_clip)
+    surrogate = torch.minimum(ratio * advantages, clipped_ratio * advantages)
+
+    # PPO clipped policy objective.
+    policy_loss = -surrogate.mean()
+    loss = policy_loss + value_weight * value_loss + invalid_action_weight * invalid_loss
     active_count = (labels_fire > 0.5).sum().detach()
+    approx_kl = (old_logprob.detach() - selected_logprob.detach()).mean()
+    clip_fraction = ((ratio.detach() - 1.0).abs() > ppo_clip).to(torch.float32).mean()
     metrics = {
         "loss": float(loss.detach().cpu()),
+        "policy_loss": float(policy_loss.detach().cpu()),
+        "value_loss": float(value_loss.detach().cpu()),
+        "invalid_loss": float(invalid_loss.detach().cpu()),
         "active_slots": float(active_count.cpu()),
         "mean_reward": float(rewards.detach().mean().cpu()),
+        "mean_value": float(mean_value.cpu()),
+        "invalid_slots": float(invalid_mask.sum().detach().cpu()),
         "mean_selected_logprob": float(selected_logprob.detach().mean().cpu()),
+        "approx_kl": float(approx_kl.cpu()),
+        "clip_fraction": float(clip_fraction.cpu()),
     }
     return loss, metrics
 

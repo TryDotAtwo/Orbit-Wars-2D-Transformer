@@ -2014,11 +2014,119 @@ __device__ float resident_intercept_angle(
   return atan2f(predicted_y - source.y, predicted_x - source.x);
 }
 
+__device__ bool sim_segment_intersects_sun(
+    float start_x, float start_y, float end_x, float end_y, const OrbitWarsCudaSimConfig& config);
+__device__ bool sim_swept_pair_hit(
+    float fleet_start_x,
+    float fleet_start_y,
+    float fleet_end_x,
+    float fleet_end_y,
+    float planet_start_x,
+    float planet_start_y,
+    float planet_end_x,
+    float planet_end_y,
+    float radius);
+__device__ bool sim_point_out_of_bounds(float x, float y, const OrbitWarsCudaSimConfig& config);
+
+__device__ void resident_next_planet_position_at_step(
+    const OrbitWarsCudaPlanet& planet,
+    const OrbitWarsCudaPlanet* initial_planets,
+    int planet_count,
+    int step,
+    float angular_velocity,
+    const OrbitWarsCudaSimConfig& config,
+    float* out_x,
+    float* out_y) {
+  *out_x = planet.x + planet.velocity_x * static_cast<float>(step);
+  *out_y = planet.y + planet.velocity_y * static_cast<float>(step);
+  for (int index = 0; index < planet_count; ++index) {
+    const OrbitWarsCudaPlanet initial = initial_planets[index];
+    if (initial.id != planet.id) continue;
+    const float dx = initial.x - config.board_center;
+    const float dy = initial.y - config.board_center;
+    const float orbital_radius = sqrtf(dx * dx + dy * dy);
+    if (orbital_radius + planet.radius < config.rotation_radius_limit) {
+      const float initial_angle = atan2f(dy, dx);
+      const float current_angle = initial_angle + angular_velocity * static_cast<float>(step > 1 ? step : 1);
+      *out_x = config.board_center + orbital_radius * cosf(current_angle);
+      *out_y = config.board_center + orbital_radius * sinf(current_angle);
+    }
+    return;
+  }
+}
+
+__device__ bool resident_target_is_probable_comet(const OrbitWarsCudaPlanet& target) {
+  return target.owner < 0 &&
+         fabsf(target.radius - 1.0f) < 0.001f &&
+         fabsf(target.production - 1.0f) < 0.001f &&
+         (fabsf(target.velocity_x) + fabsf(target.velocity_y)) > 0.001f;
+}
+
+__device__ bool resident_action_would_hit_sun_or_comet(
+    const OrbitWarsCudaPlanet& source,
+    const OrbitWarsCudaPlanet& target,
+    const OrbitWarsCudaPlanet* initial_planets,
+    int planet_count,
+    int current_step,
+    int ships,
+    float angle,
+    float angular_velocity,
+    const OrbitWarsCudaSimConfig& config) {
+  if (resident_target_is_probable_comet(target)) {
+    return true;
+  }
+  const float speed = sim_fleet_speed(static_cast<float>(ships), config);
+  const float spawn_distance = source.radius + config.fleet_spawn_offset;
+  float fleet_x = source.x + cosf(angle) * spawn_distance;
+  float fleet_y = source.y + sinf(angle) * spawn_distance;
+  float target_old_x = target.x;
+  float target_old_y = target.y;
+  for (int offset = 1; offset <= config.episode_steps; ++offset) {
+    const float fleet_new_x = fleet_x + cosf(angle) * speed;
+    const float fleet_new_y = fleet_y + sinf(angle) * speed;
+    float target_new_x = target.x;
+    float target_new_y = target.y;
+    resident_next_planet_position_at_step(
+        target,
+        initial_planets,
+        planet_count,
+        current_step + offset,
+        angular_velocity,
+        config,
+        &target_new_x,
+        &target_new_y);
+    if (sim_swept_pair_hit(
+            fleet_x,
+            fleet_y,
+            fleet_new_x,
+            fleet_new_y,
+            target_old_x,
+            target_old_y,
+            target_new_x,
+            target_new_y,
+            target.radius)) {
+      return false;
+    }
+    if (sim_point_out_of_bounds(fleet_new_x, fleet_new_y, config)) {
+      return false;
+    }
+    if (sim_segment_intersects_sun(fleet_x, fleet_y, fleet_new_x, fleet_new_y, config)) {
+      return true;
+    }
+    fleet_x = fleet_new_x;
+    fleet_y = fleet_new_y;
+    target_old_x = target_new_x;
+    target_old_y = target_new_y;
+  }
+  return false;
+}
+
 __global__ void resident_decode_actions_kernel(
     CudaSimKernelState sim,
     int* request_game_indices,
     int* request_player_ids,
     int request_count,
+    int step,
     const float* fire_logits,
     const float* source_logits,
     const float* target_logits,
@@ -2109,9 +2217,28 @@ __global__ void resident_decode_actions_kernel(
         sim.angular_velocities ? sim.angular_velocities[game] : sim.config.angular_velocity;
     const bool use_orbit_prediction = resident_target_uses_orbit_prediction(
         target, initial_planets, static_cast<int>(sim.config.planet_count), sim.config);
+    const float direction_angle = resident_intercept_angle(
+        source, target, ships, use_orbit_prediction, angular_velocity, sim.config);
+    if (resident_action_would_hit_sun_or_comet(
+            source,
+            target,
+            initial_planets,
+            static_cast<int>(sim.config.planet_count),
+            step,
+            ships,
+            direction_angle,
+            angular_velocity,
+            sim.config)) {
+      const int dense = request * ACTION_SLOTS + best_slot;
+      if (labels_fire) labels_fire[dense] = 0;
+      if (labels_confidence) labels_confidence[dense] = -1.0f;
+      label.fire[written] = 0;
+      label.confidence[written] = -1.0f;
+      continue;
+    }
     actions[written] = OrbitWarsCudaAction{
         source.id,
-        resident_intercept_angle(source, target, ships, use_orbit_prediction, angular_velocity, sim.config),
+        direction_angle,
         ships};
     used_sources[source_row] = true;
     written += 1;
@@ -3081,6 +3208,7 @@ OrbitWarsV8CudaStatus resident_model_decode_device(
       request_game_indices_device,
       request_player_ids_device,
       static_cast<int>(request_count),
+      step,
       workspace.d_fire.ptr,
       workspace.d_source.ptr,
       workspace.d_target.ptr,
@@ -3415,6 +3543,7 @@ OrbitWarsV8CudaStatus resident_models_decode_plan_impl(
         sim_state->request_game_indices.ptr + offset,
         sim_state->request_player_ids.ptr + offset,
         count,
+        step,
         workspace.d_fire.ptr,
         workspace.d_source.ptr,
         workspace.d_target.ptr,
