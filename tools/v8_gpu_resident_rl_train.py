@@ -12,6 +12,7 @@ import json
 import math
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -39,6 +40,11 @@ def main() -> None:
     parser.add_argument("--generation-tournament-games", type=int, default=0)
     parser.add_argument("--baseline-players", type=int, default=2)
     parser.add_argument("--baseline-eval-interval", type=int, default=1)
+    parser.add_argument("--external-baseline-eval-interval", type=int, default=0)
+    parser.add_argument("--external-baseline-eval-games", type=int, default=0)
+    parser.add_argument("--external-exp50-main", type=Path, default=None)
+    parser.add_argument("--external-env-src", type=Path, default=Path(".external/kaggle-env-src/kaggle_environments/envs/orbit_wars"))
+    parser.add_argument("--submission-template-dir", type=Path, default=Path("kaggle_submission"))
     parser.add_argument("--ppo-clip", type=float, default=0.2)
     parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
@@ -59,9 +65,10 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
     baseline_config = None
     baseline_state = None
     baseline_model_bin = args.baseline_model_bin
-    if baseline_model_bin is None and args.baseline_players > 0:
+    external_eval_requested = args.external_baseline_eval_interval > 0 and args.external_baseline_eval_games > 0
+    if baseline_model_bin is None and (args.baseline_players > 0 or external_eval_requested):
         baseline_model_bin = args.base_model_bin
-    if baseline_model_bin is not None and args.baseline_players > 0:
+    if baseline_model_bin is not None and (args.baseline_players > 0 or external_eval_requested):
         baseline_config, baseline_state = load_model_bin_state(baseline_model_bin)
         if baseline_config != config:
             raise ValueError(f"baseline config mismatch: {baseline_config} != {config}")
@@ -82,6 +89,9 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "generation_tournament_games": args.generation_tournament_games,
         "baseline_players": args.baseline_players,
         "baseline_eval_interval": args.baseline_eval_interval,
+        "external_baseline_eval_interval": args.external_baseline_eval_interval,
+        "external_baseline_eval_games": args.external_baseline_eval_games,
+        "external_exp50_main": str(args.external_exp50_main) if args.external_exp50_main else None,
         "ppo_clip": args.ppo_clip,
         "ppo_epochs": 1,
         "requested_ppo_epochs_ignored": args.ppo_epochs,
@@ -287,10 +297,30 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         export_model_bin(model, config, generation_model_bin)
         shutil.copy2(generation_model_bin, args.run_dir / "model.bin")
         baseline_updated = False
+        external_eval_result = None
         if baseline_eval_active and baseline_state is not None and current_wins > baseline_wins:
             baseline_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
             baseline_model_bin = generation_model_bin
             baseline_updated = True
+        external_interval = max(0, int(args.external_baseline_eval_interval))
+        external_games = max(0, int(args.external_baseline_eval_games))
+        if external_interval > 0 and external_games > 0 and generation % external_interval == 0:
+            if baseline_model_bin is None:
+                raise RuntimeError("external baseline eval requires a baseline model")
+            external_eval_result = run_external_baseline_eval(
+                args=args,
+                generation=generation,
+                baseline_model=baseline_model_bin,
+                candidate_model=generation_model_bin,
+                games=external_games,
+            )
+            if external_eval_result["candidate_wins"] >= external_eval_result["baseline_wins"]:
+                baseline_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
+                baseline_model_bin = generation_model_bin
+                baseline_updated = True
+                external_eval_result["baseline_updated"] = True
+            else:
+                external_eval_result["baseline_updated"] = False
         wins = int(valid.sum().detach().cpu())
         draws = int((~valid).sum().detach().cpu())
         elapsed = max(1.0e-6, time.perf_counter() - started)
@@ -322,6 +352,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "baseline_eval_active": baseline_eval_active,
             "baseline_eval_interval": baseline_eval_interval,
             "baseline_updated": baseline_updated,
+            "external_baseline_eval": external_eval_result,
             "other_results": other_results,
             "mean_winner_margin": mean_score_margin,
             "mean_score_margin": mean_score_margin,
@@ -389,6 +420,130 @@ def read_generation_tournament_winner(path: Path) -> tuple[int, dict]:
             best_key = key
             best_index = index
     return best_index, rows[best_index]
+
+
+def run_external_baseline_eval(
+    *,
+    args: argparse.Namespace,
+    generation: int,
+    baseline_model: Path,
+    candidate_model: Path,
+    games: int,
+) -> dict:
+    if args.external_exp50_main is None:
+        raise RuntimeError("--external-exp50-main is required for external baseline eval")
+    exp50_main = args.external_exp50_main
+    if not exp50_main.exists():
+        raise FileNotFoundError(f"external exp50 main missing: {exp50_main}")
+    template_dir = args.submission_template_dir
+    for name in ("main.py", "liborbit_wars_agent.so"):
+        if not (template_dir / name).exists():
+            raise FileNotFoundError(f"submission template missing {name}: {template_dir}")
+
+    make = load_kaggle_make_for_external_eval(args.external_env_src)
+    baseline_wins = 0
+    candidate_wins = 0
+    exp50_wins = 0
+    other_results = 0
+    baseline_score_diff = 0.0
+    candidate_score_diff = 0.0
+    rows = []
+    started = time.perf_counter()
+    with tempfile.TemporaryDirectory(prefix="orbitwars_external_eval_") as tmp_dir_raw:
+        tmp_dir = Path(tmp_dir_raw)
+        baseline_main = prepare_external_eval_agent(template_dir, baseline_model, tmp_dir / "baseline")
+        candidate_main = prepare_external_eval_agent(template_dir, candidate_model, tmp_dir / "candidate")
+        for game in range(games):
+            baseline_seat = game % 4
+            candidate_seat = (baseline_seat + 1) % 4
+            agents = [str(exp50_main), str(exp50_main), str(exp50_main), str(exp50_main)]
+            agents[baseline_seat] = str(baseline_main)
+            agents[candidate_seat] = str(candidate_main)
+            env = make("orbit_wars", configuration={"seed": 100000 + generation * 10000 + game}, debug=False)
+            env.run(agents)
+            scores = external_eval_scores(env)
+            best_score = max(scores)
+            winner_seats = [index for index, score in enumerate(scores) if score == best_score]
+            if baseline_seat in winner_seats and candidate_seat not in winner_seats:
+                baseline_wins += 1
+                winner = "baseline"
+            elif candidate_seat in winner_seats and baseline_seat not in winner_seats:
+                candidate_wins += 1
+                winner = "candidate"
+            elif any(index not in (baseline_seat, candidate_seat) for index in winner_seats):
+                exp50_wins += 1
+                winner = "exp50"
+            else:
+                other_results += 1
+                winner = "draw"
+            exp50_best = max(score for index, score in enumerate(scores) if index not in (baseline_seat, candidate_seat))
+            baseline_score_diff += scores[baseline_seat] - max(scores[candidate_seat], exp50_best)
+            candidate_score_diff += scores[candidate_seat] - max(scores[baseline_seat], exp50_best)
+            rows.append({
+                "game": game,
+                "baseline_seat": baseline_seat,
+                "candidate_seat": candidate_seat,
+                "scores": scores,
+                "winner": winner,
+            })
+
+    elapsed = max(1.0e-6, time.perf_counter() - started)
+    result = {
+        "event": "external_baseline_eval_complete",
+        "generation": generation,
+        "games": games,
+        "seconds": round(elapsed, 3),
+        "baseline_model": str(baseline_model),
+        "candidate_model": str(candidate_model),
+        "exp50_main": str(exp50_main),
+        "baseline_wins": baseline_wins,
+        "candidate_wins": candidate_wins,
+        "exp50_wins": exp50_wins,
+        "other_results": other_results,
+        "baseline_win_rate": baseline_wins / games if games else 0.0,
+        "candidate_win_rate": candidate_wins / games if games else 0.0,
+        "candidate_not_worse": candidate_wins >= baseline_wins,
+        "baseline_mean_score_diff": baseline_score_diff / games if games else 0.0,
+        "candidate_mean_score_diff": candidate_score_diff / games if games else 0.0,
+        "rows": rows,
+    }
+    print(json.dumps(result), flush=True)
+    return result
+
+
+def load_kaggle_make_for_external_eval(env_src: Path):
+    try:
+        from kaggle_environments import __file__ as kaggle_init
+        from kaggle_environments import make
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "external baseline eval needs kaggle_environments; run in Molab/Kaggle or install it"
+        ) from exc
+
+    env_dst = Path(kaggle_init).resolve().parent / "envs" / "orbit_wars"
+    if env_src.exists():
+        env_dst.mkdir(parents=True, exist_ok=True)
+        for item in env_src.iterdir():
+            target = env_dst / item.name
+            if item.is_dir():
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(item, target)
+            else:
+                shutil.copy2(item, target)
+    return make
+
+
+def prepare_external_eval_agent(template_dir: Path, model_bin: Path, out_dir: Path) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("main.py", "liborbit_wars_agent.so"):
+        shutil.copy2(template_dir / name, out_dir / name)
+    shutil.copy2(model_bin, out_dir / "model.bin")
+    return out_dir / "main.py"
+
+
+def external_eval_scores(env) -> list[float]:
+    return [float(getattr(state, "reward", 0.0) or 0.0) for state in env.steps[-1]]
 
 
 def nan_debug_payload(
