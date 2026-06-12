@@ -1,5 +1,8 @@
 ﻿use crate::config::AgentConfig;
-use crate::geometry::{intercept_angle, intercept_angle_with_orbit_prediction, GeometryError, OrbitPrediction};
+use crate::geometry::{
+    fleet_speed, intercept_angle, intercept_angle_with_orbit_prediction, point_out_of_bounds,
+    segment_intersects_sun, swept_pair_hit, GeometryError, OrbitPrediction,
+};
 use crate::types::{ActionSlotOutput, AmountClass, MoveCommand, Planet};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,12 +36,35 @@ pub fn decode_action_slots(
     slots: &[ActionSlotOutput],
     config: &AgentConfig,
 ) -> Result<Vec<MoveCommand>, DecodeError> {
+    decode_action_slots_at_step(
+        planets_by_row,
+        initial_planets,
+        comet_planet_ids,
+        player,
+        angular_velocity,
+        0,
+        slots,
+        config,
+    )
+}
+
+pub fn decode_action_slots_at_step(
+    planets_by_row: &[Planet],
+    initial_planets: &[Planet],
+    comet_planet_ids: &[i32],
+    player: i32,
+    angular_velocity: f32,
+    current_step: usize,
+    slots: &[ActionSlotOutput],
+    config: &AgentConfig,
+) -> Result<Vec<MoveCommand>, DecodeError> {
     Ok(decode_action_slots_with_trace(
         planets_by_row,
         initial_planets,
         comet_planet_ids,
         player,
         angular_velocity,
+        current_step,
         slots,
         config,
     )?
@@ -53,6 +79,7 @@ pub fn decode_action_slots_with_trace(
     comet_planet_ids: &[i32],
     player: i32,
     angular_velocity: f32,
+    current_step: usize,
     slots: &[ActionSlotOutput],
     config: &AgentConfig,
 ) -> Result<Vec<DecodedMoveCommand>, DecodeError> {
@@ -98,7 +125,7 @@ pub fn decode_action_slots_with_trace(
             continue;
         }
 
-        let direction_angle = if target_uses_orbit_prediction(&target, initial_planets, comet_planet_ids, config) {
+        let base_direction_angle = if target_uses_orbit_prediction(&target, initial_planets, comet_planet_ids, config) {
             intercept_angle_with_orbit_prediction(
                 &source,
                 &target,
@@ -108,6 +135,20 @@ pub fn decode_action_slots_with_trace(
             )?
         } else {
             intercept_angle(&source, &target, ship_count as f32, config)?
+        };
+        let Some(direction_angle) = refine_valid_action_angle(
+            &source,
+            &target,
+            planets_by_row,
+            initial_planets,
+            comet_planet_ids,
+            current_step,
+            ship_count,
+            base_direction_angle,
+            angular_velocity,
+            config,
+        ) else {
+            continue;
         };
 
         used_sources[source_row] = true;
@@ -159,4 +200,154 @@ fn target_uses_orbit_prediction(
                 orbital_radius + target.radius < config.rotation_radius_limit
             })
             .unwrap_or(false)
+}
+
+fn refine_valid_action_angle(
+    source: &Planet,
+    target: &Planet,
+    planets: &[Planet],
+    initial_planets: &[Planet],
+    comet_planet_ids: &[i32],
+    current_step: usize,
+    ship_count: i32,
+    base_angle: f32,
+    angular_velocity: f32,
+    config: &AgentConfig,
+) -> Option<f32> {
+    if action_has_valid_first_contact(
+        source,
+        target,
+        planets,
+        initial_planets,
+        comet_planet_ids,
+        current_step,
+        ship_count,
+        base_angle,
+        angular_velocity,
+        config,
+    ) {
+        return Some(base_angle);
+    }
+
+    const SEARCH_SAMPLES: usize = 160;
+    const SEARCH_STEP: f32 = 0.005;
+    for sample in 1..=SEARCH_SAMPLES {
+        let magnitude = ((sample + 1) / 2) as f32;
+        let sign = if sample & 1 == 1 { 1.0 } else { -1.0 };
+        let angle = base_angle + sign * magnitude * SEARCH_STEP;
+        if action_has_valid_first_contact(
+            source,
+            target,
+            planets,
+            initial_planets,
+            comet_planet_ids,
+            current_step,
+            ship_count,
+            angle,
+            angular_velocity,
+            config,
+        ) {
+            return Some(angle);
+        }
+    }
+
+    None
+}
+
+fn action_has_valid_first_contact(
+    source: &Planet,
+    target: &Planet,
+    planets: &[Planet],
+    initial_planets: &[Planet],
+    comet_planet_ids: &[i32],
+    current_step: usize,
+    ship_count: i32,
+    angle: f32,
+    angular_velocity: f32,
+    config: &AgentConfig,
+) -> bool {
+    if comet_planet_ids.contains(&target.id) {
+        return false;
+    }
+
+    let direction_x = angle.cos();
+    let direction_y = angle.sin();
+    let spawn_distance = source.radius + config.fleet_spawn_offset;
+    let mut fleet_x = source.x + direction_x * spawn_distance;
+    let mut fleet_y = source.y + direction_y * spawn_distance;
+    let speed = fleet_speed(ship_count as f32, config);
+    let mut old_positions: Vec<(f32, f32)> = planets.iter().map(|planet| (planet.x, planet.y)).collect();
+
+    for offset in 1..=config.episode_steps {
+        let fleet_new_x = fleet_x + direction_x * speed;
+        let fleet_new_y = fleet_y + direction_y * speed;
+        let mut new_positions = Vec::with_capacity(planets.len());
+
+        for (index, planet) in planets.iter().enumerate() {
+            let (old_x, old_y) = old_positions[index];
+            let (new_x, new_y) = next_planet_position_at_step(
+                planet,
+                initial_planets,
+                current_step + offset,
+                offset,
+                angular_velocity,
+                config,
+            );
+            new_positions.push((new_x, new_y));
+            if swept_pair_hit(
+                fleet_x,
+                fleet_y,
+                fleet_new_x,
+                fleet_new_y,
+                old_x,
+                old_y,
+                new_x,
+                new_y,
+                planet.radius,
+            ) {
+                return planet.id == target.id && !comet_planet_ids.contains(&planet.id);
+            }
+        }
+
+        if point_out_of_bounds(fleet_new_x, fleet_new_y, config) {
+            return false;
+        }
+        if segment_intersects_sun(fleet_x, fleet_y, fleet_new_x, fleet_new_y, config) {
+            return false;
+        }
+
+        fleet_x = fleet_new_x;
+        fleet_y = fleet_new_y;
+        old_positions = new_positions;
+    }
+
+    false
+}
+
+fn next_planet_position_at_step(
+    planet: &Planet,
+    initial_planets: &[Planet],
+    absolute_step: usize,
+    offset: usize,
+    angular_velocity: f32,
+    config: &AgentConfig,
+) -> (f32, f32) {
+    if let Some(initial) = initial_planets.iter().find(|initial| initial.id == planet.id) {
+        let dx = initial.x - config.board_center;
+        let dy = initial.y - config.board_center;
+        let orbital_radius = (dx * dx + dy * dy).sqrt();
+        if orbital_radius + planet.radius < config.rotation_radius_limit {
+            let initial_angle = dy.atan2(dx);
+            let angle = initial_angle + angular_velocity * absolute_step.max(1) as f32;
+            return (
+                config.board_center + orbital_radius * angle.cos(),
+                config.board_center + orbital_radius * angle.sin(),
+            );
+        }
+    }
+
+    (
+        planet.x + planet.velocity_x * offset as f32,
+        planet.y + planet.velocity_y * offset as f32,
+    )
 }

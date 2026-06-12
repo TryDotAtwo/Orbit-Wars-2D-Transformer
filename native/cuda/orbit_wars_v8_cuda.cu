@@ -2003,11 +2003,12 @@ __device__ float resident_intercept_angle(
   const float speed = sim_fleet_speed(static_cast<float>(ships), config);
   float predicted_x = target.x;
   float predicted_y = target.y;
+  const float contact_gap = source.radius + config.fleet_spawn_offset + target.radius;
   for (int iteration = 0; iteration < 128; ++iteration) {
     const float dx = predicted_x - source.x;
     const float dy = predicted_y - source.y;
     const float distance = sqrtf(dx * dx + dy * dy);
-    const float travel_time = distance / speed;
+    const float travel_time = fmaxf((distance - contact_gap) / speed, 0.0f);
     resident_predict_target_position(
         target, travel_time, use_orbit_prediction, angular_velocity, config, &predicted_x, &predicted_y);
   }
@@ -2062,9 +2063,10 @@ __device__ bool resident_target_is_probable_comet(const OrbitWarsCudaPlanet& tar
          (fabsf(target.velocity_x) + fabsf(target.velocity_y)) > 0.001f;
 }
 
-__device__ bool resident_action_would_hit_sun_or_comet(
+__device__ bool resident_action_has_valid_first_contact(
     const OrbitWarsCudaPlanet& source,
     const OrbitWarsCudaPlanet& target,
+    const OrbitWarsCudaPlanet* planets,
     const OrbitWarsCudaPlanet* initial_planets,
     int planet_count,
     int current_step,
@@ -2073,50 +2075,115 @@ __device__ bool resident_action_would_hit_sun_or_comet(
     float angular_velocity,
     const OrbitWarsCudaSimConfig& config) {
   if (resident_target_is_probable_comet(target)) {
-    return true;
+    return false;
   }
   const float speed = sim_fleet_speed(static_cast<float>(ships), config);
   const float spawn_distance = source.radius + config.fleet_spawn_offset;
   float fleet_x = source.x + cosf(angle) * spawn_distance;
   float fleet_y = source.y + sinf(angle) * spawn_distance;
-  float target_old_x = target.x;
-  float target_old_y = target.y;
+  float old_x[PLANETS];
+  float old_y[PLANETS];
+  float new_x[PLANETS];
+  float new_y[PLANETS];
+  for (int planet = 0; planet < PLANETS; ++planet) {
+    old_x[planet] = 0.0f;
+    old_y[planet] = 0.0f;
+    new_x[planet] = 0.0f;
+    new_y[planet] = 0.0f;
+  }
+  for (int planet = 0; planet < planet_count && planet < PLANETS; ++planet) {
+    old_x[planet] = planets[planet].x;
+    old_y[planet] = planets[planet].y;
+    new_x[planet] = planets[planet].x;
+    new_y[planet] = planets[planet].y;
+  }
   for (int offset = 1; offset <= config.episode_steps; ++offset) {
     const float fleet_new_x = fleet_x + cosf(angle) * speed;
     const float fleet_new_y = fleet_y + sinf(angle) * speed;
-    float target_new_x = target.x;
-    float target_new_y = target.y;
-    resident_next_planet_position_at_step(
-        target,
-        initial_planets,
-        planet_count,
-        current_step + offset,
-        angular_velocity,
-        config,
-        &target_new_x,
-        &target_new_y);
-    if (sim_swept_pair_hit(
-            fleet_x,
-            fleet_y,
-            fleet_new_x,
-            fleet_new_y,
-            target_old_x,
-            target_old_y,
-            target_new_x,
-            target_new_y,
-            target.radius)) {
-      return false;
+    int hit_planet = -1;
+    for (int planet = 0; planet < planet_count && planet < PLANETS; ++planet) {
+      const OrbitWarsCudaPlanet candidate = planets[planet];
+      if (candidate.id < 0) continue;
+      resident_next_planet_position_at_step(
+          candidate,
+          initial_planets,
+          planet_count,
+          current_step + offset,
+          angular_velocity,
+          config,
+          &new_x[planet],
+          &new_y[planet]);
+      if (sim_swept_pair_hit(
+              fleet_x,
+              fleet_y,
+              fleet_new_x,
+              fleet_new_y,
+              old_x[planet],
+              old_y[planet],
+              new_x[planet],
+              new_y[planet],
+              candidate.radius)) {
+        hit_planet = planet;
+        break;
+      }
+    }
+    if (hit_planet >= 0) {
+      const OrbitWarsCudaPlanet hit = planets[hit_planet];
+      return hit.id == target.id && !resident_target_is_probable_comet(hit);
     }
     if (sim_point_out_of_bounds(fleet_new_x, fleet_new_y, config)) {
       return false;
     }
     if (sim_segment_intersects_sun(fleet_x, fleet_y, fleet_new_x, fleet_new_y, config)) {
-      return true;
+      return false;
     }
     fleet_x = fleet_new_x;
     fleet_y = fleet_new_y;
-    target_old_x = target_new_x;
-    target_old_y = target_new_y;
+    for (int planet = 0; planet < planet_count && planet < PLANETS; ++planet) {
+      old_x[planet] = new_x[planet];
+      old_y[planet] = new_y[planet];
+    }
+  }
+  return false;
+}
+
+__device__ bool resident_refine_valid_action_angle(
+    const OrbitWarsCudaPlanet& source,
+    const OrbitWarsCudaPlanet& target,
+    const OrbitWarsCudaPlanet* planets,
+    const OrbitWarsCudaPlanet* initial_planets,
+    int planet_count,
+    int current_step,
+    int ships,
+    float base_angle,
+    float angular_velocity,
+    const OrbitWarsCudaSimConfig& config,
+    float* out_angle) {
+  if (resident_action_has_valid_first_contact(
+          source, target, planets, initial_planets, planet_count, current_step, ships, base_angle, angular_velocity, config)) {
+    *out_angle = base_angle;
+    return true;
+  }
+  constexpr int SEARCH_SAMPLES = 160;
+  constexpr float SEARCH_STEP = 0.005f;
+  for (int sample = 1; sample <= SEARCH_SAMPLES; ++sample) {
+    const int magnitude = (sample + 1) / 2;
+    const float sign = (sample & 1) ? 1.0f : -1.0f;
+    const float candidate_angle = base_angle + sign * static_cast<float>(magnitude) * SEARCH_STEP;
+    if (resident_action_has_valid_first_contact(
+            source,
+            target,
+            planets,
+            initial_planets,
+            planet_count,
+            current_step,
+            ships,
+            candidate_angle,
+            angular_velocity,
+            config)) {
+      *out_angle = candidate_angle;
+      return true;
+    }
   }
   return false;
 }
@@ -2217,18 +2284,21 @@ __global__ void resident_decode_actions_kernel(
         sim.angular_velocities ? sim.angular_velocities[game] : sim.config.angular_velocity;
     const bool use_orbit_prediction = resident_target_uses_orbit_prediction(
         target, initial_planets, static_cast<int>(sim.config.planet_count), sim.config);
-    const float direction_angle = resident_intercept_angle(
+    const float base_direction_angle = resident_intercept_angle(
         source, target, ships, use_orbit_prediction, angular_velocity, sim.config);
-    if (resident_action_would_hit_sun_or_comet(
+    float direction_angle = base_direction_angle;
+    if (!resident_refine_valid_action_angle(
             source,
             target,
+            planets,
             initial_planets,
             static_cast<int>(sim.config.planet_count),
             step,
             ships,
-            direction_angle,
+            base_direction_angle,
             angular_velocity,
-            sim.config)) {
+            sim.config,
+            &direction_angle)) {
       const int dense = request * ACTION_SLOTS + best_slot;
       if (labels_fire) labels_fire[dense] = 0;
       if (labels_confidence) labels_confidence[dense] = -1.0f;

@@ -15,6 +15,13 @@ ACTION_STRIDE = 3
 CENTER_X = 50.0
 CENTER_Y = 50.0
 ROTATION_RADIUS_LIMIT = 50.0
+BOARD_SIZE = 100.0
+SUN_RADIUS = 10.0
+FLEET_SPEED_MAX = 6.0
+FLEET_SPEED_REFERENCE_SHIPS = 1000.0
+FLEET_SPEED_CURVE_POWER = 1.5
+FLEET_SPAWN_OFFSET = 0.1
+MAX_COLLISION_STEPS = 500
 
 _MODULE_FILE = globals().get("__file__")
 _SEARCH_DIRS: list[Path] = []
@@ -93,6 +100,7 @@ class _NativeAgent:
         fleets = _get(obs, "fleets", [])
         comet_ids = [int(value) for value in _get(obs, "comet_planet_ids", [])]
         comet_velocity = _comet_velocity_map(obs)
+        comet_paths = _comet_path_map(obs)
 
         planet_buffer = _planet_buffer(planets, angular_velocity, comet_velocity)
         initial_buffer = _planet_buffer(initial_planets, angular_velocity, {})
@@ -123,11 +131,23 @@ class _NativeAgent:
         moves: list[list[float]] = []
         for action_index in range(result):
             offset = action_index * ACTION_STRIDE
-            moves.append([
+            move = [
                 int(output_buffer[offset]),
                 float(output_buffer[offset + 1]),
                 int(output_buffer[offset + 2]),
-            ])
+            ]
+            if _is_allowed_target(
+                planets,
+                initial_planets,
+                comet_ids,
+                comet_paths,
+                current_step,
+                angular_velocity,
+                move[0],
+                move[1],
+                move[2],
+            ):
+                moves.append(move)
         return moves
 
     def __del__(self) -> None:
@@ -156,6 +176,196 @@ def _row_get(row: Any, key: str, index: int, default: Any) -> Any:
 
 def _has_owned_planet(raw_planets: Any, player: int) -> bool:
     return any(int(_row_get(raw_planet, "owner", 1, -1)) == player for raw_planet in raw_planets or [])
+
+
+def _is_allowed_target(
+    raw_planets: Any,
+    raw_initial_planets: Any,
+    comet_ids: list[int],
+    comet_paths: dict[int, tuple[int, list[tuple[float, float]]]],
+    current_step: int,
+    angular_velocity: float,
+    source_id: int,
+    angle: float,
+    ship_count: int,
+) -> bool:
+    source = None
+    planets = list(raw_planets or [])
+    for raw_planet in planets:
+        if int(_row_get(raw_planet, "id", 0, -1)) == source_id:
+            source = raw_planet
+            break
+    if source is None:
+        return False
+
+    initial_by_id = {
+        int(_row_get(raw_planet, "id", 0, -1)): raw_planet
+        for raw_planet in raw_initial_planets or []
+    }
+    comet_id_set = set(comet_ids)
+    source_x = float(_row_get(source, "x", 2, 0.0))
+    source_y = float(_row_get(source, "y", 3, 0.0))
+    source_radius = float(_row_get(source, "radius", 4, 1.0))
+    direction_x = math.cos(angle)
+    direction_y = math.sin(angle)
+
+    fleet_x = source_x + direction_x * (source_radius + FLEET_SPAWN_OFFSET)
+    fleet_y = source_y + direction_y * (source_radius + FLEET_SPAWN_OFFSET)
+    speed = _fleet_speed(ship_count)
+    planet_positions = {
+        int(_row_get(raw_planet, "id", 0, -1)): (
+            float(_row_get(raw_planet, "x", 2, 0.0)),
+            float(_row_get(raw_planet, "y", 3, 0.0)),
+        )
+        for raw_planet in planets
+    }
+
+    for step_offset in range(1, MAX_COLLISION_STEPS + 1):
+        fleet_new_x = fleet_x + direction_x * speed
+        fleet_new_y = fleet_y + direction_y * speed
+        next_positions: dict[int, tuple[float, float]] = {}
+
+        for raw_planet in planets:
+            planet_id = int(_row_get(raw_planet, "id", 0, -1))
+            old_x, old_y = planet_positions.get(
+                planet_id,
+                (
+                    float(_row_get(raw_planet, "x", 2, 0.0)),
+                    float(_row_get(raw_planet, "y", 3, 0.0)),
+                ),
+            )
+            new_x, new_y, check_collision = _next_planet_position(
+                raw_planet,
+                initial_by_id.get(planet_id),
+                comet_paths.get(planet_id),
+                old_x,
+                old_y,
+                current_step + step_offset,
+                step_offset,
+                angular_velocity,
+            )
+            next_positions[planet_id] = (new_x, new_y)
+            if not check_collision:
+                continue
+            if _swept_pair_hit(
+                fleet_x,
+                fleet_y,
+                fleet_new_x,
+                fleet_new_y,
+                old_x,
+                old_y,
+                new_x,
+                new_y,
+                float(_row_get(raw_planet, "radius", 4, 1.0)),
+            ):
+                return planet_id not in comet_id_set
+
+        if _point_out_of_bounds(fleet_new_x, fleet_new_y):
+            return False
+        if _segment_intersects_sun(fleet_x, fleet_y, fleet_new_x, fleet_new_y):
+            return False
+
+        fleet_x = fleet_new_x
+        fleet_y = fleet_new_y
+        planet_positions = next_positions
+
+    return False
+
+
+def _fleet_speed(ship_count: int) -> float:
+    ships = max(1.0, float(ship_count))
+    speed_ratio = min(1.0, max(0.0, math.log(ships) / math.log(FLEET_SPEED_REFERENCE_SHIPS)))
+    return 1.0 + (FLEET_SPEED_MAX - 1.0) * (speed_ratio ** FLEET_SPEED_CURVE_POWER)
+
+
+def _next_planet_position(
+    raw_planet: Any,
+    raw_initial_planet: Any,
+    comet_path: tuple[int, list[tuple[float, float]]] | None,
+    old_x: float,
+    old_y: float,
+    step: int,
+    step_offset: int,
+    angular_velocity: float,
+) -> tuple[float, float, bool]:
+    if comet_path is not None:
+        current_path_index, path = comet_path
+        path_index = current_path_index + step_offset
+        if 0 <= path_index < len(path):
+            x, y = path[path_index]
+            return x, y, x >= 0.0
+        return old_x, old_y, True
+
+    if raw_initial_planet is not None:
+        initial_x = float(_row_get(raw_initial_planet, "x", 2, 0.0))
+        initial_y = float(_row_get(raw_initial_planet, "y", 3, 0.0))
+        radius = float(_row_get(raw_planet, "radius", 4, 1.0))
+        dx = initial_x - CENTER_X
+        dy = initial_y - CENTER_Y
+        orbital_radius = math.hypot(dx, dy)
+        if orbital_radius + radius < ROTATION_RADIUS_LIMIT:
+            current_angle = math.atan2(dy, dx) + angular_velocity * max(1, step)
+            return (
+                CENTER_X + orbital_radius * math.cos(current_angle),
+                CENTER_Y + orbital_radius * math.sin(current_angle),
+                True,
+            )
+
+    return (
+        float(_row_get(raw_planet, "x", 2, 0.0)),
+        float(_row_get(raw_planet, "y", 3, 0.0)),
+        True,
+    )
+
+
+def _swept_pair_hit(
+    fleet_start_x: float,
+    fleet_start_y: float,
+    fleet_end_x: float,
+    fleet_end_y: float,
+    planet_start_x: float,
+    planet_start_y: float,
+    planet_end_x: float,
+    planet_end_y: float,
+    radius: float,
+) -> bool:
+    delta_start_x = fleet_start_x - planet_start_x
+    delta_start_y = fleet_start_y - planet_start_y
+    delta_velocity_x = (fleet_end_x - fleet_start_x) - (planet_end_x - planet_start_x)
+    delta_velocity_y = (fleet_end_y - fleet_start_y) - (planet_end_y - planet_start_y)
+    a = delta_velocity_x * delta_velocity_x + delta_velocity_y * delta_velocity_y
+    b = 2.0 * (delta_start_x * delta_velocity_x + delta_start_y * delta_velocity_y)
+    c = delta_start_x * delta_start_x + delta_start_y * delta_start_y - radius * radius
+    if a < sys.float_info.epsilon:
+        return c <= 0.0
+    discriminant = b * b - 4.0 * a * c
+    if discriminant < 0.0:
+        return False
+    root = math.sqrt(discriminant)
+    entry = (-b - root) / (2.0 * a)
+    exit = (-b + root) / (2.0 * a)
+    return exit >= 0.0 and entry <= 1.0
+
+
+def _segment_intersects_sun(start_x: float, start_y: float, end_x: float, end_y: float) -> bool:
+    dx = end_x - start_x
+    dy = end_y - start_y
+    length_squared = dx * dx + dy * dy
+    if length_squared == 0.0:
+        closest_x = start_x
+        closest_y = start_y
+    else:
+        projection = ((CENTER_X - start_x) * dx + (CENTER_Y - start_y) * dy) / length_squared
+        projection = min(1.0, max(0.0, projection))
+        closest_x = start_x + projection * dx
+        closest_y = start_y + projection * dy
+    closest_dx = closest_x - CENTER_X
+    closest_dy = closest_y - CENTER_Y
+    return closest_dx * closest_dx + closest_dy * closest_dy < SUN_RADIUS * SUN_RADIUS
+
+
+def _point_out_of_bounds(x: float, y: float) -> bool:
+    return x < 0.0 or y < 0.0 or x > BOARD_SIZE or y > BOARD_SIZE
 
 
 def _planet_buffer(
@@ -234,6 +444,24 @@ def _comet_velocity_map(obs: Any) -> dict[int, tuple[float, float]]:
                     float(next_point[1]) - float(current[1]),
                 )
     return velocity_by_planet_id
+
+
+def _comet_path_map(obs: Any) -> dict[int, tuple[int, list[tuple[float, float]]]]:
+    path_by_planet_id: dict[int, tuple[int, list[tuple[float, float]]]] = {}
+    for comet_group in _get(obs, "comets", []):
+        if not isinstance(comet_group, dict):
+            continue
+        planet_ids = comet_group.get("planet_ids", [])
+        paths = comet_group.get("paths", [])
+        path_index = int(comet_group.get("path_index", 0))
+        for planet_id, path in zip(planet_ids, paths):
+            points: list[tuple[float, float]] = []
+            for point in path:
+                if isinstance(point, (list, tuple)) and len(point) >= 2:
+                    points.append((float(point[0]), float(point[1])))
+            if points:
+                path_by_planet_id[int(planet_id)] = (path_index, points)
+    return path_by_planet_id
 
 
 def agent(obs: Any) -> list[list[float]]:

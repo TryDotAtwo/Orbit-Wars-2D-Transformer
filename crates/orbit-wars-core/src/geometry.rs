@@ -70,11 +70,12 @@ fn intercept_angle_with_prediction(
 
     let mut predicted_x = target.x;
     let mut predicted_y = target.y;
+    let contact_gap = source.radius + config.fleet_spawn_offset + target.radius;
     for _ in 0..config.intercept_iterations {
         let dx = predicted_x - source.x;
         let dy = predicted_y - source.y;
         let distance = (dx * dx + dy * dy).sqrt();
-        let travel_time = distance / speed;
+        let travel_time = ((distance - contact_gap) / speed).max(0.0);
         let predicted = predict_target_position(target, travel_time, orbit);
         predicted_x = predicted.0;
         predicted_y = predicted.1;

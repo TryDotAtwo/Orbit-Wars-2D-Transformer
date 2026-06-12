@@ -1,6 +1,6 @@
 use std::slice;
 
-use orbit_wars_core::{decode_action_slots, ActionSlotOutput, AgentConfig, Fleet, Planet, V8Model};
+use orbit_wars_core::{decode_action_slots_at_step, ActionSlotOutput, AgentConfig, Fleet, Planet, V8Model};
 
 const PLANET_STRIDE: usize = 9;
 const FLEET_STRIDE: usize = 7;
@@ -134,7 +134,7 @@ pub unsafe extern "C" fn agent_act_v8(
         },
         None => heuristic_slots(&planets, player),
     };
-    let commands = match decode_action_slots(
+    let commands = match decode_action_slots_at_step(
         &planets,
         if initial_planets.is_empty() {
             &planets
@@ -144,6 +144,7 @@ pub unsafe extern "C" fn agent_act_v8(
         &comet_ids,
         player,
         angular_velocity as f32,
+        _current_step,
         &slots,
         &runtime.config,
     ) {

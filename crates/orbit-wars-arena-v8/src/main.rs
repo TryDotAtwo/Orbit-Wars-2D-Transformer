@@ -8,8 +8,8 @@ use std::time::Instant;
 mod v8_cuda;
 
 use orbit_wars_core::{
-    decode_action_slots, is_terminal, ActionSlotOutput, AgentConfig, Fleet, MoveCommand, Planet,
-    SimulationState, V8Model,
+    decode_action_slots_at_step, is_terminal, ActionSlotOutput, AgentConfig, Fleet, MoveCommand,
+    Planet, SimulationState, V8Model,
 };
 
 const DEFAULT_GAMES: usize = 16;
@@ -669,12 +669,13 @@ fn run_cuda_game_batch(
         let slots_by_request = cuda_model.forward_tokens(model, &token_batch)?;
         let mut actions_by_game = vec![vec![Vec::<MoveCommand>::new(); player_count]; games.len()];
         for ((game_index, player), slots) in requests.into_iter().zip(slots_by_request.iter()) {
-            actions_by_game[game_index][player] = decode_action_slots(
+            actions_by_game[game_index][player] = decode_action_slots_at_step(
                 &games[game_index].state.planets,
                 &games[game_index].state.initial_planets,
                 &[],
                 player as i32,
                 games[game_index].state.angular_velocity,
+                games[game_index].state.step,
                 slots,
                 config,
             )
@@ -826,12 +827,13 @@ fn run_cuda_model_game_batch(
             }
             let slots = cuda_models[model_id].forward_tokens(&models[model_id], &tokens_by_model[model_id])?;
             for ((game_index, player), slot_rows) in requests_by_model[model_id].iter().copied().zip(slots.iter()) {
-                actions_by_game[game_index][player] = decode_action_slots(
+                actions_by_game[game_index][player] = decode_action_slots_at_step(
                     &games[game_index].state.planets,
                     &games[game_index].state.initial_planets,
                     &[],
                     player as i32,
                     games[game_index].state.angular_velocity,
+                    games[game_index].state.step,
                     slot_rows,
                     config,
                 )
@@ -1463,12 +1465,13 @@ fn player_actions(
                     &state.fleets,
                 )
                 .map_err(|error| format!("model_forward_failed={error:?}"))?;
-            decode_action_slots(
+            decode_action_slots_at_step(
                 &state.planets,
                 &state.initial_planets,
                 &[],
                 player,
                 state.angular_velocity,
+                state.step,
                 &slots,
                 config,
             )
@@ -1500,12 +1503,13 @@ fn player_actions_cuda_batch(
     let mut actions = Vec::with_capacity(player_count);
     for (player, slots) in slots_by_player.iter().enumerate() {
         actions.push(
-            decode_action_slots(
+            decode_action_slots_at_step(
                 &state.planets,
                 &state.initial_planets,
                 &[],
                 player as i32,
                 state.angular_velocity,
+                state.step,
                 slots,
                 config,
             )
@@ -1881,12 +1885,13 @@ fn heuristic_actions(
     slots[0].source_logits[source_row] = 10.0;
     slots[0].target_logits[target_row] = 10.0;
     slots[0].amount_logits[2] = 10.0;
-    decode_action_slots(
+    decode_action_slots_at_step(
         &state.planets,
         &state.initial_planets,
         &[],
         player,
         state.angular_velocity,
+        state.step,
         &slots,
         config,
     )
