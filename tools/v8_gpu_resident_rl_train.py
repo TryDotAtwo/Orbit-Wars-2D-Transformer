@@ -38,6 +38,7 @@ def main() -> None:
     parser.add_argument("--train-batch-requests", type=int, default=512)
     parser.add_argument("--generation-tournament-games", type=int, default=0)
     parser.add_argument("--baseline-players", type=int, default=2)
+    parser.add_argument("--baseline-eval-interval", type=int, default=1)
     parser.add_argument("--ppo-clip", type=float, default=0.2)
     parser.add_argument("--ppo-epochs", type=int, default=1)
     parser.add_argument("--arena-bin", type=Path, default=Path("target/release/orbit-wars-arena-v8"))
@@ -80,6 +81,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "train_batch_requests": args.train_batch_requests,
         "generation_tournament_games": args.generation_tournament_games,
         "baseline_players": args.baseline_players,
+        "baseline_eval_interval": args.baseline_eval_interval,
         "ppo_clip": args.ppo_clip,
         "ppo_epochs": args.ppo_epochs,
         "debug_nan": args.debug_nan,
@@ -90,11 +92,13 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         started = time.perf_counter()
         native_model = runtime.create_model_from_state({key: value.detach().cpu() for key, value in model.state_dict().items()})
         native_baseline_model = None
-        if baseline_state is not None:
+        baseline_eval_interval = max(1, int(args.baseline_eval_interval))
+        baseline_eval_active = baseline_state is not None and generation % baseline_eval_interval == 0
+        if baseline_eval_active:
             native_baseline_model = runtime.create_model_from_state(baseline_state)
         sim = runtime.create_sim(games=args.games, players=args.players, step_limit=args.steps)
         runtime.load_official_like_games(sim, generation=generation)
-        baseline_player_count = min(max(0, int(args.baseline_players)), max(0, args.players - 1))
+        baseline_player_count = min(max(0, int(args.baseline_players)), max(0, args.players - 1)) if baseline_eval_active else 0
         current_player_count = args.players - baseline_player_count if native_baseline_model is not None else args.players
         current_mask = sim.request_players < current_player_count
         baseline_mask = ~current_mask
@@ -298,7 +302,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         export_model_bin(model, config, generation_model_bin)
         shutil.copy2(generation_model_bin, args.run_dir / "model.bin")
         baseline_updated = False
-        if baseline_state is not None and current_wins > baseline_wins:
+        if baseline_eval_active and baseline_state is not None and current_wins > baseline_wins:
             baseline_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
             baseline_model_bin = generation_model_bin
             baseline_updated = True
@@ -329,6 +333,8 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "draws_as_losses": draws,
             "current_model_wins": current_wins,
             "baseline_model_wins": baseline_wins,
+            "baseline_eval_active": baseline_eval_active,
+            "baseline_eval_interval": baseline_eval_interval,
             "baseline_updated": baseline_updated,
             "other_results": other_results,
             "mean_winner_margin": mean_score_margin,
