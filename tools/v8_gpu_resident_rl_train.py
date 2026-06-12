@@ -157,24 +157,15 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                         "seconds": round(elapsed, 3),
                         "eta_seconds": round(seconds_per_step * steps_left, 3),
                     }), flush=True)
+            game_rewards = runtime.score_diff_rewards(sim)
+            score_margins = game_rewards.max(dim=1).values
             statuses, stats = runtime.read_status_stats(sim)
-            planets, fleets, _next_ids, _state_stats = runtime.read_state(sim)
         finally:
             runtime.destroy_model(native_model)
             if native_baseline_model is not None:
                 runtime.destroy_model(native_baseline_model)
             runtime.destroy_sim(sim)
 
-        rewards_cpu, margins_cpu = outcome_rewards(
-            statuses,
-            planets,
-            fleets,
-            games=args.games,
-            players=args.players,
-            planet_count=sim.config.planet_count,
-            max_fleets=sim.config.max_fleets_per_game,
-        )
-        game_rewards = torch.as_tensor(rewards_cpu, device="cuda", dtype=torch.float32)
         current_wins = 0
         baseline_wins = 0
         other_results = 0
@@ -274,6 +265,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         mean_approx_kl = approx_kl_total / max(1, finite_chunks)
         mean_clip_fraction = clip_fraction_total / max(1, finite_chunks)
         mean_invalid_slots = invalid_slots_total / max(1, finite_chunks)
+        mean_score_margin = float(score_margins.detach().mean().cpu())
 
         generation_dir = args.run_dir / f"generation-{generation:04d}"
         generation_dir.mkdir(parents=True, exist_ok=True)
@@ -294,7 +286,8 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 "invalid_slots": mean_invalid_slots,
                 "fire_rate": float(fire_rate.detach().cpu()),
                 "active_slots": mean_active_slots,
-                "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
+                "mean_winner_margin": mean_score_margin,
+                "mean_score_margin": mean_score_margin,
                 "finite_chunks": finite_chunks,
                 "skipped_nan_chunks": skipped_nan_chunks,
                 "update_applied": update_applied,
@@ -338,7 +331,8 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
             "baseline_model_wins": baseline_wins,
             "baseline_updated": baseline_updated,
             "other_results": other_results,
-            "mean_winner_margin": sum(margins_cpu) / max(1, len(margins_cpu)),
+            "mean_winner_margin": mean_score_margin,
+            "mean_score_margin": mean_score_margin,
             "checkpoint": str(checkpoint),
             "generation_model_bin": str(generation_model_bin),
             "model_bin": str(args.run_dir / "model.bin"),
@@ -346,33 +340,6 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
 
     if args.generation_tournament_games > 0:
         run_generation_tournament(args)
-
-
-def outcome_rewards(statuses, planets, fleets, *, games: int, players: int, planet_count: int, max_fleets: int) -> tuple[list[list[float]], list[float]]:
-    rewards = [[0.0 for _ in range(players)] for _ in range(games)]
-    margins: list[float] = []
-    for game in range(games):
-        scores = [0.0 for _ in range(players)]
-        planet_base = game * planet_count
-        for row in range(planet_count):
-            planet = planets[planet_base + row]
-            owner = int(planet.owner)
-            if 0 <= owner < players:
-                scores[owner] += math.floor(float(planet.ships))
-        fleet_base = game * max_fleets
-        for row in range(max_fleets):
-            fleet = fleets[fleet_base + row]
-            owner = int(fleet.owner)
-            if int(fleet.alive) and 0 <= owner < players:
-                scores[owner] += math.floor(float(fleet.ships))
-        score_diffs: list[float] = []
-        for player, score in enumerate(scores):
-            opponent_best = max((other_score for other_player, other_score in enumerate(scores) if other_player != player), default=0.0)
-            diff = score - opponent_best
-            score_diffs.append(diff)
-            rewards[game][player] = math.copysign(math.sqrt(abs(diff)), diff) if diff != 0.0 else 0.0
-        margins.append(max(score_diffs) if score_diffs else 0.0)
-    return rewards, margins
 
 
 def run_generation_tournament(args: argparse.Namespace) -> None:

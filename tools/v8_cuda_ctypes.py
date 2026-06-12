@@ -213,6 +213,11 @@ class V8CudaRuntime:
             ctypes.POINTER(CudaSimStats),
         ]
         self.lib.orbit_wars_cuda_sim_read_status_stats.restype = CudaStatus
+        self.lib.orbit_wars_cuda_sim_score_diff_rewards.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+        ]
+        self.lib.orbit_wars_cuda_sim_score_diff_rewards.restype = CudaStatus
         self.lib.orbit_wars_cuda_sim_read.argtypes = [
             ctypes.c_void_p,
             ctypes.POINTER(CudaPlanet),
@@ -405,6 +410,21 @@ class V8CudaRuntime:
             "sim_read_status_stats",
         )
         return list(statuses), list(stats)
+
+    def score_diff_rewards(self, sim: NativeSim) -> torch.Tensor:
+        rewards = torch.empty(
+            (sim.config.game_count, sim.config.max_players),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        self.require(
+            self.lib.orbit_wars_cuda_sim_score_diff_rewards(
+                sim.ptr,
+                ctypes.c_void_p(rewards.data_ptr()),
+            ),
+            "sim_score_diff_rewards",
+        )
+        return rewards
 
     def read_state(self, sim: NativeSim) -> tuple[list[CudaPlanet], list[CudaFleet], list[int], list[CudaSimStats]]:
         planets = (CudaPlanet * (sim.config.game_count * sim.config.planet_count))()

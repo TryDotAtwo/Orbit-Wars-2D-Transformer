@@ -2807,6 +2807,44 @@ __global__ void sim_update_status_kernel(CudaSimKernelState state, int step_afte
   status.winner = best_count == 1 ? best_player : -1;
 }
 
+__global__ void sim_score_diff_rewards_kernel(CudaSimKernelState state, float* rewards) {
+  const OrbitWarsCudaSimConfig config = state.config;
+  const int game = blockIdx.x * blockDim.x + threadIdx.x;
+  if (game >= static_cast<int>(config.game_count) || !rewards) {
+    return;
+  }
+  int scores[4] = {0, 0, 0, 0};
+  OrbitWarsCudaPlanet* planets = state.planets + static_cast<size_t>(game) * config.planet_count;
+  for (int planet = 0; planet < static_cast<int>(config.planet_count); ++planet) {
+    const int owner = planets[planet].owner;
+    if (owner >= 0 && owner < static_cast<int>(config.max_players) && owner < 4) {
+      scores[owner] += static_cast<int>(floorf(planets[planet].ships));
+    }
+  }
+  OrbitWarsCudaFleet* fleets = state.fleets + static_cast<size_t>(game) * config.max_fleets_per_game;
+  for (int fleet = 0; fleet < static_cast<int>(config.max_fleets_per_game); ++fleet) {
+    if (!fleets[fleet].alive) continue;
+    const int owner = fleets[fleet].owner;
+    if (owner >= 0 && owner < static_cast<int>(config.max_players) && owner < 4) {
+      scores[owner] += static_cast<int>(floorf(fleets[fleet].ships));
+    }
+  }
+  for (int player = 0; player < static_cast<int>(config.max_players) && player < 4; ++player) {
+    int opponent_best = -2147483647;
+    for (int other = 0; other < static_cast<int>(config.max_players) && other < 4; ++other) {
+      if (other == player) continue;
+      opponent_best = max(opponent_best, scores[other]);
+    }
+    if (opponent_best == -2147483647) {
+      opponent_best = 0;
+    }
+    const int diff = scores[player] - opponent_best;
+    const float magnitude = sqrtf(static_cast<float>(abs(diff)));
+    rewards[static_cast<size_t>(game) * config.max_players + player] =
+        diff > 0 ? magnitude : (diff < 0 ? -magnitude : 0.0f);
+  }
+}
+
 __device__ void add_sim_stats(OrbitWarsCudaSimStats& dst, const OrbitWarsCudaSimStats& src) {
   dst.launched_fleet_count += src.launched_fleet_count;
   dst.launched_ship_count += src.launched_ship_count;
@@ -3765,6 +3803,22 @@ extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_read_status_stats(
   cudaError_t error = state->statuses.copy_to_host(statuses, config.game_count);
   if (error != cudaSuccess) return cuda_error(error);
   error = state->stats.copy_to_host(stats, config.game_count * config.max_players);
+  if (error != cudaSuccess) return cuda_error(error);
+  return ok();
+}
+
+extern "C" OrbitWarsV8CudaStatus orbit_wars_cuda_sim_score_diff_rewards(
+    OrbitWarsCudaSimState* opaque,
+    float* rewards_device) {
+  if (!opaque || !rewards_device) {
+    return bad_argument("null sim score diff reward argument");
+  }
+  auto* state = reinterpret_cast<CudaSimState*>(opaque);
+  const auto& config = state->config;
+  sim_score_diff_rewards_kernel<<<blocks_for(static_cast<int>(config.game_count)), 256>>>(
+      sim_kernel_state(state),
+      rewards_device);
+  cudaError_t error = cudaGetLastError();
   if (error != cudaSuccess) return cuda_error(error);
   return ok();
 }
