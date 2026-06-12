@@ -21,7 +21,6 @@ class ResidentBatchTensorView:
     labels_target: torch.Tensor
     labels_amount: torch.Tensor
     labels_confidence: torch.Tensor
-    old_logprob: torch.Tensor | None = None
 
     @property
     def request_count(self) -> int:
