@@ -128,7 +128,8 @@ def next_planet_position(
         orbit_radius = math.hypot(dx, dy)
         radius = float(row_get(planet, 4, 1.0))
         if orbit_radius + radius < 50.0:
-            angle = math.atan2(dy, dx) + angular_velocity * max(1, step)
+            phase_step = max(0, step - 1)
+            angle = math.atan2(dy, dx) + angular_velocity * phase_step
             return CENTER + orbit_radius * math.cos(angle), CENTER + orbit_radius * math.sin(angle), True
 
     return float(row_get(planet, 2, 0.0)), float(row_get(planet, 3, 0.0)), True

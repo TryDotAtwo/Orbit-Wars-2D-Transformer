@@ -338,7 +338,8 @@ fn next_planet_position_at_step(
         let orbital_radius = (dx * dx + dy * dy).sqrt();
         if orbital_radius + planet.radius < config.rotation_radius_limit {
             let initial_angle = dy.atan2(dx);
-            let angle = initial_angle + angular_velocity * absolute_step.max(1) as f32;
+            let phase_step = absolute_step.saturating_sub(1);
+            let angle = initial_angle + angular_velocity * phase_step as f32;
             return (
                 config.board_center + orbital_radius * angle.cos(),
                 config.board_center + orbital_radius * angle.sin(),

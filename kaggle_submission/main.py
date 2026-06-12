@@ -304,7 +304,8 @@ def _next_planet_position(
         dy = initial_y - CENTER_Y
         orbital_radius = math.hypot(dx, dy)
         if orbital_radius + radius < ROTATION_RADIUS_LIMIT:
-            current_angle = math.atan2(dy, dx) + angular_velocity * max(1, step)
+            phase_step = max(0, step - 1)
+            current_angle = math.atan2(dy, dx) + angular_velocity * phase_step
             return (
                 CENTER_X + orbital_radius * math.cos(current_angle),
                 CENTER_Y + orbital_radius * math.sin(current_angle),

@@ -2048,7 +2048,8 @@ __device__ void resident_next_planet_position_at_step(
     const float orbital_radius = sqrtf(dx * dx + dy * dy);
     if (orbital_radius + planet.radius < config.rotation_radius_limit) {
       const float initial_angle = atan2f(dy, dx);
-      const float current_angle = initial_angle + angular_velocity * static_cast<float>(step > 1 ? step : 1);
+      const int phase_step = step > 0 ? step - 1 : 0;
+      const float current_angle = initial_angle + angular_velocity * static_cast<float>(phase_step);
       *out_x = config.board_center + orbital_radius * cosf(current_angle);
       *out_y = config.board_center + orbital_radius * sinf(current_angle);
     }
