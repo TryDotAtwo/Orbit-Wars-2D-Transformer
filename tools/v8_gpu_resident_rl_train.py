@@ -349,10 +349,9 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
 
 
 def outcome_rewards(statuses, planets, fleets, *, games: int, players: int, planet_count: int, max_fleets: int) -> tuple[list[list[float]], list[float]]:
-    rewards = [[-0.2 for _ in range(players)] for _ in range(games)]
+    rewards = [[0.0 for _ in range(players)] for _ in range(games)]
     margins: list[float] = []
     for game in range(games):
-        winner = int(statuses[game].winner)
         scores = [0.0 for _ in range(players)]
         planet_base = game * planet_count
         for row in range(planet_count):
@@ -366,16 +365,13 @@ def outcome_rewards(statuses, planets, fleets, *, games: int, players: int, plan
             owner = int(fleet.owner)
             if int(fleet.alive) and 0 <= owner < players:
                 scores[owner] += math.floor(float(fleet.ships))
-        if winner < 0:
-            margins.append(0.0)
-            continue
-        winner_score = scores[winner]
-        runner_up = max((score for player, score in enumerate(scores) if player != winner), default=0.0)
-        margin = max(0.0, winner_score - runner_up)
-        scale = max(1.0, winner_score + runner_up)
-        bonus = min(0.1, 0.1 * margin / scale)
-        rewards[game][winner] = 1.0 + bonus
-        margins.append(margin)
+        score_diffs: list[float] = []
+        for player, score in enumerate(scores):
+            opponent_best = max((other_score for other_player, other_score in enumerate(scores) if other_player != player), default=0.0)
+            diff = score - opponent_best
+            score_diffs.append(diff)
+            rewards[game][player] = math.copysign(math.sqrt(abs(diff)), diff) if diff != 0.0 else 0.0
+        margins.append(max(score_diffs) if score_diffs else 0.0)
     return rewards, margins
 
 
