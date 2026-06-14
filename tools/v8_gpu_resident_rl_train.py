@@ -43,6 +43,7 @@ def main() -> None:
     parser.add_argument("--external-baseline-eval-interval", type=int, default=0)
     parser.add_argument("--external-baseline-eval-games", type=int, default=0)
     parser.add_argument("--external-exp50-main", type=Path, default=None)
+    parser.add_argument("--external-candidate-vs-exp50-only", action="store_true")
     parser.add_argument("--external-env-src", type=Path, default=Path(".external/kaggle-env-src/kaggle_environments/envs/orbit_wars"))
     parser.add_argument("--submission-template-dir", type=Path, default=Path("kaggle_submission"))
     parser.add_argument("--ppo-clip", type=float, default=0.2)
@@ -92,6 +93,7 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
         "external_baseline_eval_interval": args.external_baseline_eval_interval,
         "external_baseline_eval_games": args.external_baseline_eval_games,
         "external_exp50_main": str(args.external_exp50_main) if args.external_exp50_main else None,
+        "external_candidate_vs_exp50_only": args.external_candidate_vs_exp50_only,
         "ppo_clip": args.ppo_clip,
         "ppo_epochs": 1,
         "requested_ppo_epochs_ignored": args.ppo_epochs,
@@ -314,7 +316,10 @@ def run_gpu_resident_rl(args: argparse.Namespace) -> None:
                 candidate_model=generation_model_bin,
                 games=external_games,
             )
-            if external_eval_result["candidate_wins"] >= external_eval_result["baseline_wins"]:
+            if (
+                not args.external_candidate_vs_exp50_only
+                and external_eval_result["candidate_wins"] >= external_eval_result["baseline_wins"]
+            ):
                 baseline_state = {key: value.detach().cpu() for key, value in model.state_dict().items()}
                 baseline_model_bin = generation_model_bin
                 baseline_updated = True
@@ -451,20 +456,27 @@ def run_external_baseline_eval(
     started = time.perf_counter()
     with tempfile.TemporaryDirectory(prefix="orbitwars_external_eval_") as tmp_dir_raw:
         tmp_dir = Path(tmp_dir_raw)
-        baseline_main = prepare_external_eval_agent(template_dir, baseline_model, tmp_dir / "baseline")
+        baseline_main = None
+        if not args.external_candidate_vs_exp50_only:
+            baseline_main = prepare_external_eval_agent(template_dir, baseline_model, tmp_dir / "baseline")
         candidate_main = prepare_external_eval_agent(template_dir, candidate_model, tmp_dir / "candidate")
         for game in range(games):
-            baseline_seat = game % 4
-            candidate_seat = (baseline_seat + 1) % 4
+            if args.external_candidate_vs_exp50_only:
+                baseline_seat = -1
+                candidate_seat = game % 4
+            else:
+                baseline_seat = game % 4
+                candidate_seat = (baseline_seat + 1) % 4
             agents = [str(exp50_main), str(exp50_main), str(exp50_main), str(exp50_main)]
-            agents[baseline_seat] = str(baseline_main)
+            if baseline_main is not None:
+                agents[baseline_seat] = str(baseline_main)
             agents[candidate_seat] = str(candidate_main)
             env = make("orbit_wars", configuration={"seed": 100000 + generation * 10000 + game}, debug=False)
             env.run(agents)
             scores = external_eval_scores(env)
             best_score = max(scores)
             winner_seats = [index for index, score in enumerate(scores) if score == best_score]
-            if baseline_seat in winner_seats and candidate_seat not in winner_seats:
+            if baseline_seat >= 0 and baseline_seat in winner_seats and candidate_seat not in winner_seats:
                 baseline_wins += 1
                 winner = "baseline"
             elif candidate_seat in winner_seats and baseline_seat not in winner_seats:
@@ -477,8 +489,11 @@ def run_external_baseline_eval(
                 other_results += 1
                 winner = "draw"
             exp50_best = max(score for index, score in enumerate(scores) if index not in (baseline_seat, candidate_seat))
-            baseline_score_diff += scores[baseline_seat] - max(scores[candidate_seat], exp50_best)
-            candidate_score_diff += scores[candidate_seat] - max(scores[baseline_seat], exp50_best)
+            if baseline_seat >= 0:
+                baseline_score_diff += scores[baseline_seat] - max(scores[candidate_seat], exp50_best)
+                candidate_score_diff += scores[candidate_seat] - max(scores[baseline_seat], exp50_best)
+            else:
+                candidate_score_diff += scores[candidate_seat] - exp50_best
             rows.append({
                 "game": game,
                 "baseline_seat": baseline_seat,
@@ -496,6 +511,7 @@ def run_external_baseline_eval(
         "baseline_model": str(baseline_model),
         "candidate_model": str(candidate_model),
         "exp50_main": str(exp50_main),
+        "candidate_vs_exp50_only": bool(args.external_candidate_vs_exp50_only),
         "baseline_wins": baseline_wins,
         "candidate_wins": candidate_wins,
         "exp50_wins": exp50_wins,
@@ -503,6 +519,7 @@ def run_external_baseline_eval(
         "baseline_win_rate": baseline_wins / games if games else 0.0,
         "candidate_win_rate": candidate_wins / games if games else 0.0,
         "candidate_not_worse": candidate_wins >= baseline_wins,
+        "candidate_beats_exp50": candidate_wins > exp50_wins,
         "baseline_mean_score_diff": baseline_score_diff / games if games else 0.0,
         "candidate_mean_score_diff": candidate_score_diff / games if games else 0.0,
         "rows": rows,
