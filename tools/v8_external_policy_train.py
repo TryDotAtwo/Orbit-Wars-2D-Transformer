@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""External RL against three exp50 agents.
+"""External policy training against fixed opponent agents.
 
 This path is intentionally separate from the GPU-resident self-play loop:
-exp50 is a Python Kaggle agent, so training against the real exp50 requires
-running the Kaggle environment.  Backprop still runs on CUDA.
+fixed Python Kaggle agents require running the Kaggle environment.  Backprop
+still runs on CUDA.
 """
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import shutil
 import sys
 import tempfile
@@ -34,7 +33,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-model-bin", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
-    parser.add_argument("--exp50-main", type=Path, required=True)
+    parser.add_argument("--opponent-main", type=Path, required=True)
     parser.add_argument("--submission-template-dir", type=Path, default=Path("kaggle_submission"))
     parser.add_argument("--external-env-src", type=Path, default=Path(".external/kaggle-env-src/kaggle_environments/envs/orbit_wars"))
     parser.add_argument("--generations", type=int, default=10)
@@ -53,9 +52,9 @@ def main() -> None:
 
 def run(args: argparse.Namespace) -> None:
     if args.players != 4:
-        raise RuntimeError("exp50 external RL currently expects exactly 4 players")
-    if not args.exp50_main.exists():
-        raise FileNotFoundError(f"exp50 main missing: {args.exp50_main}")
+        raise RuntimeError("external policy training currently expects exactly 4 players")
+    if not args.opponent_main.exists():
+        raise FileNotFoundError(f"opponent main missing: {args.opponent_main}")
 
     args.run_dir.mkdir(parents=True, exist_ok=True)
     make = load_kaggle_make(args.external_env_src)
@@ -75,15 +74,15 @@ def run(args: argparse.Namespace) -> None:
     )
 
     print(json.dumps({
-        "event": "exp50_external_rl_start",
+        "event": "external_policy_train_start",
         "base_model": str(args.base_model_bin),
         "run_dir": str(args.run_dir),
-        "exp50_main": str(args.exp50_main),
+        "opponent_main": str(args.opponent_main),
         "generations": args.generations,
         "games": args.games,
         "players": args.players,
         "steps": args.steps,
-        "reward": "sqrt(score_diff)*sign(score_diff)",
+        "reward": "score_diff",
         "device": device,
         "bf16": bool(args.bf16),
     }, ensure_ascii=False), flush=True)
@@ -96,7 +95,7 @@ def run(args: argparse.Namespace) -> None:
         export_model_bin(model, config, generation_model_bin)
         shutil.copy2(generation_model_bin, args.run_dir / "model.bin")
 
-        samples, game_rows = collect_exp50_rollouts(
+        samples, game_rows = collect_external_rollouts(
             args=args,
             make=make,
             model_bin=generation_model_bin,
@@ -133,7 +132,7 @@ def run(args: argparse.Namespace) -> None:
         mean_reward = sum(float(row["reward"]) for row in game_rows) / max(1, len(game_rows))
         elapsed = max(1.0e-6, time.perf_counter() - started)
         print(json.dumps({
-            "event": "exp50_external_rl_generation_complete",
+            "event": "external_policy_generation_complete",
             "generation": generation,
             "seconds": round(elapsed, 3),
             "games": args.games,
@@ -157,7 +156,7 @@ def load_kaggle_make(env_src: Path):
         from kaggle_environments import __file__ as kaggle_init
         from kaggle_environments import make
     except ModuleNotFoundError as exc:
-        raise RuntimeError("kaggle_environments is required for exp50 external RL") from exc
+        raise RuntimeError("kaggle_environments is required for external policy training") from exc
 
     env_dst = Path(kaggle_init).resolve().parent / "envs" / "orbit_wars"
     env_dst.mkdir(parents=True, exist_ok=True)
@@ -173,7 +172,7 @@ def load_kaggle_make(env_src: Path):
     return make
 
 
-def collect_exp50_rollouts(
+def collect_external_rollouts(
     *,
     args: argparse.Namespace,
     make: Any,
@@ -184,14 +183,14 @@ def collect_exp50_rollouts(
     samples: list[dict[str, Any]] = []
     progress_games = max(0, int(args.progress_games))
 
-    with tempfile.TemporaryDirectory(prefix="orbitwars_exp50_rl_") as tmp_dir_raw:
+    with tempfile.TemporaryDirectory(prefix="orbitwars_external_policy_") as tmp_dir_raw:
         tmp_dir = Path(tmp_dir_raw)
         our_main = prepare_agent(args.submission_template_dir, model_bin, tmp_dir / "candidate")
-        exp50_main = args.exp50_main
+        opponent_main = args.opponent_main
 
         for game in range(args.games):
             seat = game % args.players
-            agents = [str(exp50_main), str(exp50_main), str(exp50_main), str(exp50_main)]
+            agents = [str(opponent_main), str(opponent_main), str(opponent_main), str(opponent_main)]
             agents[seat] = str(our_main)
             seed = args.seed + generation * 100000 + game
             env = make("orbit_wars", configuration={"seed": seed, "episodeSteps": args.steps}, debug=False)
@@ -200,7 +199,7 @@ def collect_exp50_rollouts(
             our_score = scores[seat]
             best_other = max(score for index, score in enumerate(scores) if index != seat)
             score_diff = our_score - best_other
-            reward = signed_sqrt(score_diff)
+            reward = score_diff
             result = "win" if score_diff > 0 else "loss" if score_diff < 0 else "draw"
 
             for step_index in range(max(0, len(env.steps) - 1)):
@@ -213,7 +212,7 @@ def collect_exp50_rollouts(
                 sample = build_sample(
                     observation,
                     action,
-                    f"exp50_rl:g{generation}:game{game}:step{step_index}:seat{seat}",
+                    f"external_policy:g{generation}:game{game}:step{step_index}:seat{seat}",
                     target_traces=None,
                 )
                 sample["outcome_reward"] = reward
@@ -225,14 +224,14 @@ def collect_exp50_rollouts(
                 "seat": seat,
                 "scores": scores,
                 "our_score": our_score,
-                "best_exp50_score": best_other,
+                "best_opponent_score": best_other,
                 "score_diff": score_diff,
                 "reward": reward,
                 "result": result,
             })
             if progress_games > 0 and ((game + 1) % progress_games == 0 or game + 1 == args.games):
                 print(json.dumps({
-                    "event": "exp50_external_rl_game_progress",
+                    "event": "external_policy_game_progress",
                     "generation": generation,
                     "game": game + 1,
                     "games": args.games,
@@ -261,12 +260,6 @@ def state_field(state: Any, name: str) -> Any:
     if isinstance(state, dict):
         return state.get(name)
     return getattr(state, name, None)
-
-
-def signed_sqrt(value: float) -> float:
-    if value == 0.0:
-        return 0.0
-    return math.copysign(math.sqrt(abs(value)), value)
 
 
 def train_on_samples(
